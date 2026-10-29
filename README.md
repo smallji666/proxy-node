@@ -29,7 +29,7 @@
 在 VPS 上以 **root** 执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB/proxy-node/main/setup.sh -o /root/setup-proxy.sh && bash /root/setup-proxy.sh
+curl -fsSL https://raw.githubusercontent.com/smallji666/proxy-node/main/setup.sh -o /root/setup-proxy.sh && bash /root/setup-proxy.sh
 ```
 
 > 为什么不直接 `curl | bash`：下载成文件再执行，脚本才能把自己软链成 `proxy` 管理命令。

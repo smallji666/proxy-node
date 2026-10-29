@@ -32,7 +32,7 @@ BACKUP_DIR="${STATE_DIR}/backup"
 SUB_DIR="/var/www/proxy-sub"
 LOG_FILE="/var/log/proxy-deploy.log"
 # 发布到 GitHub 后, 把这里改成你自己的仓库地址(README 里的 sed 会一并替换)
-REPO_URL="https://github.com/YOUR_GITHUB/proxy-node"
+REPO_URL="https://github.com/smallji666/proxy-node"
 
 # ---------------- 记录用户显式传入的环境变量 ----------------
 # 未传时置为哨兵值, 以便 load_state 之后判断是否需要覆盖
