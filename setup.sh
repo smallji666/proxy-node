@@ -32,7 +32,7 @@ BACKUP_DIR="${STATE_DIR}/backup"
 SUB_DIR="/var/www/proxy-sub"
 LOG_FILE="/var/log/proxy-deploy.log"
 # 发布到 GitHub 后, 把这里改成你自己的仓库地址(README 里的 sed 会一并替换)
-REPO_URL="https://github.com/smallji666/proxy-node"
+REPO_URL="https://github.com/YOUR_GITHUB/proxy-node"
 
 # ---------------- 记录用户显式传入的环境变量 ----------------
 # 未传时置为哨兵值, 以便 load_state 之后判断是否需要覆盖
@@ -260,11 +260,17 @@ ensure_creds(){
 }
 
 # ---------------- Xray 配置 ----------------
+# WITH_DNS=1 时写入内置 DNS(解析更快更稳); 若当前 Xray 版本不接受会自动回退
+WITH_DNS="${WITH_DNS:-1}"
 write_xray_config(){
-  local dest="$1"
+  local dest="$1" dns_json=""
+  if [ "$WITH_DNS" = "1" ]; then
+    dns_json='  "dns": { "servers": [ "1.1.1.1", "8.8.8.8", "localhost" ], "queryStrategy": "UseIPv4" },'
+  fi
   cat > "$XRAY_CFG" <<EOF
 {
   "log": { "loglevel": "warning" },
+${dns_json}
   "inbounds": [
     {
       "listen": "0.0.0.0",
@@ -306,6 +312,12 @@ write_xray_config(){
   }
 }
 EOF
+  # 带 DNS 块的配置若不被当前版本接受, 自动去掉 DNS 块重写一次
+  if [ -n "$dns_json" ] && ! $XRAY_BIN run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
+    warn "内置 DNS 配置不被当前 Xray 版本接受, 回退为系统解析"
+    WITH_DNS=0
+    write_xray_config "$dest"
+  fi
 }
 
 verify_reality(){
@@ -341,6 +353,16 @@ is_blocked(){
   return 1
 }
 
+# 检测目标站是否套在 Cloudflare 后面(看证书签发者)
+# 用于拦住"用户把自己套了 CF 的域名填进来"这种情况
+dest_behind_cloudflare(){
+  local d="$1" issuer
+  issuer=$(timeout 8 openssl s_client -connect "${d}:443" -servername "$d" </dev/null 2>/dev/null \
+           | openssl x509 -noout -issuer 2>/dev/null)
+  [ -n "$issuer" ] || return 1
+  echo "$issuer" | grep -qi "cloudflare"
+}
+
 pick_dest(){
   local cands=() d h
   [ -n "$REALITY_DEST" ] && cands+=("$REALITY_DEST")
@@ -351,6 +373,9 @@ pick_dest(){
   for d in "${cands[@]}"; do
     if is_blocked "$d"; then
       warn "$d 在排除名单(CDN/证书链共用/不回显 session_id), 跳过"; continue
+    fi
+    if dest_behind_cloudflare "$d"; then
+      warn "$d 证书由 Cloudflare 签发(站点套了 CF), TLS 行为不稳定, 跳过"; continue
     fi
     h=$(curl -sI -o /dev/null -w '%{http_code}' --max-time 8 "https://$d/" 2>/dev/null)
     if [ "$h" = "000" ]; then warn "$d 不可达, 跳过"; continue; fi
@@ -559,9 +584,33 @@ net.ipv4.tcp_rmem=4096 87380 16777216
 net.ipv4.tcp_wmem=4096 65536 16777216
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.ip_forward=1
+# 空闲后不重置拥塞窗口, 长连接(视频/直播)不会每隔一阵子重新慢启动
+net.ipv4.tcp_slow_start_after_idle=0
+# 降低小包发送延迟, 对交互类流量更跟手
+net.ipv4.tcp_notsent_lowat=16384
+# 并发连接能力
+net.core.somaxconn=8192
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_syncookies=1
+fs.file-max=1048576
 SYSCTL
   sysctl -p /etc/sysctl.d/99-proxy-optimize.conf >/dev/null 2>&1
   ok "BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+
+  # conntrack 上限(模块未加载时忽略)
+  if [ -d /proc/sys/net/netfilter ]; then
+    echo 65536 > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null && \
+      ok "conntrack_max: 65536"
+  fi
+
+  # journald 限容: 小硬盘机器最容易被日志写满
+  mkdir -p /etc/systemd/journald.conf.d
+  cat > /etc/systemd/journald.conf.d/99-proxy-size.conf <<'JOURNAL'
+[Journal]
+SystemMaxUse=100M
+SystemMaxFileSize=20M
+JOURNAL
+  systemctl restart systemd-journald >/dev/null 2>&1 && ok "journald 日志上限: 100M"
 
   if [ "$(free -m | awk '/Swap:/{print $2}')" = "0" ] && [ ! -f /swapfile ]; then
     fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null
@@ -570,6 +619,65 @@ SYSCTL
     ok "已添加 1GB swap"
   else
     ok "swap 已就绪"
+  fi
+}
+
+# ---------------- 健康检查 ----------------
+install_healthcheck(){
+  cat > /usr/local/bin/proxy-healthcheck.sh <<'HEALTH'
+#!/usr/bin/env bash
+# 由 proxy-installer 安装: 定时检查服务与端口, 异常自动拉起
+set -u
+ST=/etc/proxy-node/state.env
+[ -f "$ST" ] || exit 0
+# shellcheck disable=SC1090
+. "$ST"
+
+bad=0
+systemctl is-active --quiet xray || bad=1
+if [ "$bad" = "0" ] && ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${VLESS_PORT}$"; then
+  bad=1
+fi
+if [ "$bad" = "1" ]; then
+  systemctl restart xray >/dev/null 2>&1
+  logger -t proxy-healthcheck "xray 异常, 已尝试重启"
+fi
+
+if ! systemctl is-active --quiet hysteria-server; then
+  systemctl restart hysteria-server >/dev/null 2>&1
+  logger -t proxy-healthcheck "hysteria2 异常, 已尝试重启"
+fi
+HEALTH
+  chmod 755 /usr/local/bin/proxy-healthcheck.sh
+
+  cat > /etc/systemd/system/proxy-healthcheck.service <<'UNIT'
+[Unit]
+Description=Proxy health check (one shot)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxy-healthcheck.sh
+UNIT
+
+  cat > /etc/systemd/system/proxy-healthcheck.timer <<'UNIT'
+[Unit]
+Description=Run proxy health check every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now proxy-healthcheck.timer >/dev/null 2>&1
+  if systemctl is-active --quiet proxy-healthcheck.timer; then
+    ok "健康检查已启用(每 5 分钟, 异常自动重启)"
+  else
+    warn "健康检查定时器启动失败, 已跳过"
   fi
 }
 
@@ -858,6 +966,7 @@ cmd_install(){
   setup_hy2_hop
   optimize_system
   setup_firewall
+  install_healthcheck
 
   save_state
   gen_links
@@ -986,6 +1095,125 @@ cmd_logs(){
   esac
 }
 
+# 通过本地 REALITY 隧道实测真实出口 IP
+egress_ip_via_proxy(){
+  cat > /tmp/_ec.json <<EOF
+{
+  "log": { "loglevel": "error" },
+  "inbounds": [ { "port": 10897, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": false } } ],
+  "outbounds": [ {
+    "protocol": "vless",
+    "settings": { "vnext": [ { "address": "127.0.0.1", "port": ${VLESS_PORT},
+      "users": [ { "id": "${UUID}", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
+    "streamSettings": { "network": "tcp", "security": "reality",
+      "realitySettings": { "serverName": "${DEST}", "fingerprint": "chrome",
+        "publicKey": "${PUB}", "shortId": "${SID}", "spiderX": "/" } }
+  } ]
+}
+EOF
+  $XRAY_BIN -c /tmp/_ec.json >/tmp/_ec.log 2>&1 &
+  local pid=$! ip=""
+  sleep 3
+  ip=$(curl -s --socks5-hostname 127.0.0.1:10897 --max-time 12 https://api.ipify.org 2>/dev/null \
+    || curl -s --socks5-hostname 127.0.0.1:10897 --max-time 12 https://ifconfig.me 2>/dev/null || echo "")
+  kill $pid >/dev/null 2>&1; wait $pid 2>/dev/null
+  rm -f /tmp/_ec.json /tmp/_ec.log
+  echo "$ip" | tr -d '[:space:]'
+}
+
+cmd_audit(){
+  need_root
+  load_state || die "尚未安装"
+  local dnsbl=0
+  [ "${1:-}" = "--dnsbl" ] && dnsbl=1
+  SERVER_IP="${SERVER_IP:-$(get_server_ip)}"
+
+  echo
+  hr
+  echo -e "${M}出口 IP 实测${N}"
+  hr
+  echo "节点 IP        : ${SERVER_IP}"
+  local eip; eip=$(egress_ip_via_proxy)
+  if [ -z "$eip" ]; then
+    warn "隧道实测失败, 无法确认出口(检查服务是否正常: proxy status)"
+  elif [ "$eip" = "$SERVER_IP" ]; then
+    ok "隧道出口 IP    : ${eip}  (与本机一致, 无中转/无泄漏)"
+  else
+    warn "隧道出口 IP    : ${eip}  (与本机 ${SERVER_IP} 不同!)"
+    echo "   说明流量经过了中转或存在泄漏, TikTok 会看到 ${eip} 这个地址"
+  fi
+
+  echo
+  hr
+  echo -e "${M}IP 画像${N}"
+  hr
+  local ptr
+  ptr=$(getent hosts "$SERVER_IP" 2>/dev/null | awk '{print $2}' | head -1)
+  if [ -n "$ptr" ]; then
+    echo "反向解析 PTR   : ${ptr}"
+  else
+    warn "反向解析 PTR   : 无记录 (会提高可疑度, 可找服务商加一条)"
+  fi
+
+  local ipv6pub
+  ipv6pub=$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)
+  if [ "${ipv6pub:-0}" -gt 0 ]; then
+    warn "公网 IPv6      : 存在 ${ipv6pub} 个地址 (已由路由规则拦截, 但建议在服务商侧关掉)"
+  else
+    ok "公网 IPv6      : 无 (不会出现 IPv6 泄漏)"
+  fi
+
+  echo
+  hr
+  echo -e "${M}系统状态${N}"
+  hr
+  local ntp
+  ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+  case "$ntp" in
+    yes) ok "时间同步       : 已同步 ($(date '+%Z %z'))" ;;
+    no)  warn "时间同步       : 未同步 (REALITY 依赖时间校验, 请开 NTP)" ;;
+    *)   echo "时间同步       : $(date '+%Z %z')" ;;
+  esac
+  echo "拥塞控制       : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo "journald 上限  : $(journalctl --disk-usage 2>/dev/null | sed 's/.*take up //')"
+  echo "磁盘占用       : $(df -h / | awk 'NR==2{print $3" / "$2" ("$5")"}')"
+  echo "内存           : $(free -m | awk '/Mem:/{print $3"MB / "$2"MB"}')"
+
+  if [ "$dnsbl" = "1" ]; then
+    echo
+    hr
+    echo -e "${M}反垃圾库查询 (仅 DNS 查询, 不涉及账号)${N}"
+    hr
+    local rev r
+    rev=$(echo "$SERVER_IP" | awk -F. '{print $4"."$3"."$2"."$1}')
+    r=$(getent hosts "${rev}.zen.spamhaus.org" 2>/dev/null | awk '{print $1}' | head -1)
+    case "$r" in
+      "")              ok "Spamhaus ZEN   : 未列入" ;;
+      127.255.255.*)   warn "Spamhaus ZEN   : 查询被拒(公共 DNS 限制), 换本地 DNS 再试" ;;
+      127.0.0.*)       warn "Spamhaus ZEN   : 已列入 ${r}" ;;
+      *)               echo "Spamhaus ZEN   : ${r}" ;;
+    esac
+  else
+    echo
+    echo -e "${D}反垃圾库查询默认关闭(会把 IP 提交给第三方 DNS 库)。需要时: proxy audit --dnsbl${N}"
+  fi
+
+  echo
+  hr
+  echo -e "${M}客户端侧检查清单 (服务端改不了, 但直接影响账号安全)${N}"
+  hr
+  cat <<'CHECK'
+  [ ] 关闭 WebRTC         浏览器里 WebRTC 会绕过代理暴露真实 IP
+  [ ] 关闭 IPv6           手机/电脑网络设置里关掉, 避免绕过代理
+  [ ] DNS 走远程          客户端设 8.8.8.8 / 1.1.1.1, 别用运营商 DNS
+  [ ] 时区/语言/地区一致  做哪个区就全设那个区, 三者必须对得上
+  [ ] 一号一 IP           多个账号共用同一出口 IP 是最典型的关联信号
+  [ ] 固定不切换          频繁换 IP 会触发异常登录
+  [ ] 指纹浏览器          多账号运营不要用同一个浏览器指纹
+CHECK
+  echo
+}
+
 cmd_reset(){
   need_root
   load_state || die "尚未安装"
@@ -1035,12 +1263,14 @@ cmd_uninstall(){
   need_root
   warn "将停止并删除 xray / hysteria2 服务、配置与订阅文件"
   ask_yes "确认卸载?" || { info "已取消"; return 0; }
-  systemctl disable --now xray hysteria-server hy2-hop proxy-sub >/dev/null 2>&1
+  systemctl disable --now xray hysteria-server hy2-hop proxy-sub proxy-healthcheck.timer >/dev/null 2>&1
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/hysteria-server.service \
-        /etc/systemd/system/hy2-hop.service /etc/systemd/system/proxy-sub.service
+        /etc/systemd/system/hy2-hop.service /etc/systemd/system/proxy-sub.service \
+        /etc/systemd/system/proxy-healthcheck.service /etc/systemd/system/proxy-healthcheck.timer
   systemctl daemon-reload
   rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/hysteria "$SUB_DIR" "$STATE_DIR"
-  rm -f "$XRAY_BIN" "$HY2_BIN" "/usr/local/bin/${APP_NAME}" /root/proxy-info.txt
+  rm -f "$XRAY_BIN" "$HY2_BIN" "/usr/local/bin/${APP_NAME}" /root/proxy-info.txt \
+        /usr/local/bin/proxy-healthcheck.sh
   if [ -n "${HY2_HOP:-}" ]; then
     local s="${HY2_HOP%%-*}" e="${HY2_HOP##*-}"
     iptables -t nat -D PREROUTING -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
@@ -1069,8 +1299,9 @@ menu(){
     echo "  5) 重启服务"
     echo "  6) 实时日志 (xray)"
     echo "  7) 实时日志 (hysteria2)"
-    echo "  8) 重置凭据 (换 UUID/密钥, 需重新导入)"
-    echo "  9) 卸载"
+    echo "  8) 线路体检 (出口 IP / PTR / 时间 / 客户端清单)"
+    echo "  9) 重置凭据 (换 UUID/密钥, 需重新导入)"
+    echo "  u) 卸载"
     echo "  0) 退出"
     echo
     local c=""
@@ -1083,8 +1314,9 @@ menu(){
       5) cmd_restart ;;
       6) cmd_logs xray ;;
       7) cmd_logs hy2 ;;
-      8) cmd_reset ;;
-      9) cmd_uninstall ;;
+      8) cmd_audit ;;
+      9) cmd_reset ;;
+      u|U) cmd_uninstall ;;
       0|q|Q) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -1106,6 +1338,7 @@ Proxy Node Installer v2
   status           服务状态与监听端口
   restart          重启 xray 与 hysteria2
   logs [xray|hy2]  实时日志
+  audit [--dnsbl]  线路体检(出口 IP / PTR / 时间 / 客户端清单)
   reset            重置凭据(会作废现有客户端)
   uninstall        卸载
   upgrade          升级 Xray 内核(危险, 默认不建议)
@@ -1134,6 +1367,7 @@ main(){
     status)         cmd_status ;;
     restart)        cmd_restart ;;
     logs)           cmd_logs "${2:-xray}" ;;
+    audit)          cmd_audit "${2:-}" ;;
     reset)          cmd_reset ;;
     uninstall)      cmd_uninstall ;;
     upgrade)        cmd_upgrade ;;
