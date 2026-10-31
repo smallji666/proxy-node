@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Proxy Node Installer  v2
+#  Proxy Node Installer  v3
 #  VLESS + REALITY (xtls-rprx-vision)  +  Hysteria2
 #  一键部署 + 日常管理 + 订阅生成
 # ------------------------------------------------------------
@@ -27,13 +27,14 @@
 set -uo pipefail
 
 APP_NAME="proxy"
+SCRIPT_VERSION="3.0.0"
 STATE_DIR="/etc/proxy-node"
 STATE_FILE="${STATE_DIR}/state.env"
+USERS_FILE="${STATE_DIR}/users.txt"
 BACKUP_DIR="${STATE_DIR}/backup"
 SUB_DIR="/var/www/proxy-sub"
 LOG_FILE="/var/log/proxy-deploy.log"
-# 发布到 GitHub 后, 把这里改成你自己的仓库地址(README 里的 sed 会一并替换)
-REPO_URL="https://github.com/YOUR_GITHUB/proxy-node"
+REPO_URL="https://github.com/smallji666/proxy-node"
 
 # ---------------- 记录用户显式传入的环境变量 ----------------
 # 未传时置为哨兵值, 以便 load_state 之后判断是否需要覆盖
@@ -273,8 +274,35 @@ ensure_creds(){
     PRIV=$(echo "$keys" | grep -oE '[A-Za-z0-9_-]{43}' | sed -n 1p)
     PUB=$(echo "$keys"  | grep -oE '[A-Za-z0-9_-]{43}' | sed -n 2p)
   fi
-  [ -n "$PRIV" ] && [ -n "$PUB" ] || die "x25519 密钥生成失败: $keys"
+  [ -n "$PRIV" ] && [ -n "$PUB" ] || die "x25519 密钥生成失败(输出格式无法解析), 请确认 xray x25519 可正常执行"
   ok "新凭据已生成"
+}
+
+# ---------------- 多设备凭据 ----------------
+# 每台设备一个 UUID: 丢手机时只吊销那一条, 其他设备不受影响
+ensure_users_file(){
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  if [ ! -s "$USERS_FILE" ]; then
+    printf '%s|%s|%s\n' "${UUID}" "default" "$(date '+%Y-%m-%d')" > "$USERS_FILE"
+    chmod 600 "$USERS_FILE"
+  fi
+}
+
+build_clients_json(){
+  local out="" u n sep=""
+  while IFS='|' read -r u n _; do
+    [ -n "$u" ] || continue
+    out="${out}${sep}{ \"id\": \"${u}\", \"flow\": \"xtls-rprx-vision\", \"email\": \"${n}\" }"
+    sep=", "
+  done < "$USERS_FILE"
+  [ -n "$out" ] || out="{ \"id\": \"${UUID}\", \"flow\": \"xtls-rprx-vision\" }"
+  CLIENTS_JSON="[ ${out} ]"
+}
+
+primary_uuid(){
+  local u
+  u=$(head -1 "$USERS_FILE" 2>/dev/null | cut -d'|' -f1)
+  echo "${u:-$UUID}"
 }
 
 # ---------------- Xray 配置 ----------------
@@ -282,6 +310,8 @@ ensure_creds(){
 WITH_DNS="${WITH_DNS:-1}"
 write_xray_config(){
   local dest="$1" dns_json=""
+  ensure_users_file
+  build_clients_json
   if [ "$WITH_DNS" = "1" ]; then
     dns_json='  "dns": { "servers": [ "1.1.1.1", "8.8.8.8", "localhost" ], "queryStrategy": "UseIPv4" },'
   fi
@@ -295,7 +325,7 @@ ${dns_json}
       "port": ${VLESS_PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [ { "id": "${UUID}", "flow": "xtls-rprx-vision" } ],
+        "clients": ${CLIENTS_JSON},
         "decryption": "none"
       },
       "streamSettings": {
@@ -347,7 +377,7 @@ verify_reality(){
   "outbounds": [ {
     "protocol": "vless",
     "settings": { "vnext": [ { "address": "127.0.0.1", "port": ${VLESS_PORT},
-      "users": [ { "id": "${UUID}", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
+      "users": [ { "id": "$(primary_uuid)", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
     "streamSettings": { "network": "tcp", "security": "reality",
       "realitySettings": { "serverName": "${dest}", "fingerprint": "chrome",
         "publicKey": "${PUB}", "shortId": "${SID}", "spiderX": "/" } }
@@ -407,6 +437,14 @@ pick_dest(){
     fi
     warn "$d 握手失败, 换下一个"
   done
+  # 全部失败: 把服务恢复到上一次能用的配置, 不要留在最后一个失败配置上
+  local last
+  last=$(ls -1t "$BACKUP_DIR"/xray-*.json 2>/dev/null | head -1)
+  if [ -n "$last" ]; then
+    cp -f "$last" "$XRAY_CFG"
+    systemctl restart xray >/dev/null 2>&1
+    warn "已回滚到上一次可用配置: $(basename "$last")"
+  fi
   return 1
 }
 
@@ -688,14 +726,16 @@ net.core.somaxconn=8192
 net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.tcp_syncookies=1
 fs.file-max=1048576
+# 连接跟踪表上限(模块未加载时该行会被内核忽略)
+net.netfilter.nf_conntrack_max=65536
 SYSCTL
   sysctl -p /etc/sysctl.d/99-proxy-optimize.conf >/dev/null 2>&1
   ok "BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
 
-  # conntrack 上限(模块未加载时忽略)
-  if [ -d /proc/sys/net/netfilter ]; then
-    echo 65536 > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null && \
-      ok "conntrack_max: 65536"
+  # conntrack 上限已写进 sysctl 持久化, 这里补一次运行时生效
+  if [ -w /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    echo 65536 > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true
+    ok "conntrack_max: $(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
   fi
 
   # journald 限容: 小硬盘机器最容易被日志写满
@@ -793,7 +833,8 @@ setup_firewall(){
 
 # ---------------- 链接生成 ----------------
 gen_links(){
-  VLESS_LINK="vless://${UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${NODE_NAME}-VLESS"
+  PRIMARY_UUID=$(primary_uuid)
+  VLESS_LINK="vless://${PRIMARY_UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${NODE_NAME}-VLESS"
   local hb="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}"
   if [ -n "${HY2_HOP:-}" ]; then hb="${hb}&mport=${HY2_HOP}"; fi
   if [ "$ENABLE_OBFS" = "1" ]; then
@@ -812,6 +853,7 @@ gen_links(){
 
 # ---------------- 订阅文件 ----------------
 gen_sub_files(){
+  PRIMARY_UUID="${PRIMARY_UUID:-$(primary_uuid)}"
   mkdir -p "$SUB_DIR"; chmod 755 "$SUB_DIR"
   # 放一个 index.html 遮住目录列表, 否则访问根路径会把 token 目录名列出来
   if [ ! -f "$SUB_DIR/index.html" ]; then
@@ -839,7 +881,7 @@ HTML
     echo "    type: vless"
     echo "    server: ${SERVER_IP}"
     echo "    port: ${VLESS_PORT}"
-    echo "    uuid: ${UUID}"
+    echo "    uuid: ${PRIMARY_UUID}"
     echo "    network: tcp"
     echo "    udp: true"
     echo "    tls: true"
@@ -893,7 +935,7 @@ HTML
     {
       "type": "vless", "tag": "vless-out",
       "server": "${SERVER_IP}", "server_port": ${VLESS_PORT},
-      "uuid": "${UUID}", "flow": "xtls-rprx-vision",
+      "uuid": "${PRIMARY_UUID}", "flow": "xtls-rprx-vision",
       "tls": {
         "enabled": true, "server_name": "${DEST}",
         "utls": { "enabled": true, "fingerprint": "chrome" },
@@ -1107,13 +1149,32 @@ self_check(){
   fi
 }
 
+# ---------------- 安装前预检 ----------------
+preflight(){
+  local mem_mb ntp ipv6cnt
+  mem_mb=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
+  if [ -n "$mem_mb" ] && [ "$mem_mb" -lt 400 ]; then
+    warn "内存仅 ${mem_mb}MB: Xray + Hysteria2 同时跑会吃紧, 脚本会自动补 1GB swap"
+  fi
+
+  ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "")
+  if [ "$ntp" = "no" ]; then
+    warn "系统时间未同步: REALITY 对时间敏感, 建议 systemctl enable --now systemd-timesyncd"
+  fi
+
+  ipv6cnt=$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)
+  if [ "${ipv6cnt:-0}" -gt 0 ]; then
+    info "检测到公网 IPv6: 客户端 v6 目标已被路由规则拦截, 建议在服务商侧也关掉"
+  fi
+}
+
 # ---------------- 安装主流程 ----------------
 cmd_install(){
   need_root
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
   echo
   echo -e "${M}============================================================${N}"
-  echo -e "${M}   Proxy Node Installer v2${N}"
+  echo -e "${M}   Proxy Node Installer v${SCRIPT_VERSION}${N}"
   echo -e "${M}============================================================${N}"
   echo
 
@@ -1132,6 +1193,7 @@ cmd_install(){
   fi
 
   install_deps
+  preflight
 
   if [ "$fresh" = "1" ] && port_in_use "$VLESS_PORT"; then
     warn "TCP ${VLESS_PORT} 已被占用:"
@@ -1281,6 +1343,8 @@ cmd_status(){
   echo -e "${M}出口 IPv4${N} : ${SERVER_IP:-未知}"
   echo -e "${M}Xray 版本${N} : $($XRAY_BIN version 2>/dev/null | head -1)"
   echo -e "${M}拥塞控制${N}  : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo -e "${M}设备凭据${N}  : $(wc -l < "$USERS_FILE" 2>/dev/null || echo 0) 条 (proxy user list)"
+  echo -e "${M}脚本版本${N}  : ${SCRIPT_VERSION}"
   echo
 }
 
@@ -1310,7 +1374,7 @@ egress_ip_via_proxy(){
   "outbounds": [ {
     "protocol": "vless",
     "settings": { "vnext": [ { "address": "127.0.0.1", "port": ${VLESS_PORT},
-      "users": [ { "id": "${UUID}", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
+      "users": [ { "id": "$(primary_uuid)", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
     "streamSettings": { "network": "tcp", "security": "reality",
       "realitySettings": { "serverName": "${DEST}", "fingerprint": "chrome",
         "publicKey": "${PUB}", "shortId": "${SID}", "spiderX": "/" } }
@@ -1420,12 +1484,90 @@ CHECK
   echo
 }
 
+# ---------------- 多设备凭据管理 ----------------
+user_vless_link(){
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s-%s' \
+    "$1" "$SERVER_IP" "$VLESS_PORT" "$DEST" "$PUB" "$SID" "$NODE_NAME" "$2"
+}
+
+# 按名字(第2列)或 UUID 前缀(第1列)找一行
+find_user_line(){
+  awk -F'|' -v k="$1" '$2==k || ($1!="" && index($1,k)==1) {print; exit}' "$USERS_FILE"
+}
+
+cmd_user(){
+  need_root
+  load_state || die "尚未安装"
+  ensure_users_file
+  SERVER_IP="${SERVER_IP:-$(get_server_ip)}"
+  local sub="${1:-list}"
+
+  case "$sub" in
+    add)
+      local name="${2:-}"
+      [ -n "$name" ] || die "用法: proxy user add <名字>   例如 proxy user add iPhone"
+      name="${name//|/_}"
+      [ -z "$(find_user_line "$name")" ] || die "已存在同名凭据: ${name}"
+      local nu; nu=$(cat /proc/sys/kernel/random/uuid)
+      printf '%s|%s|%s\n' "$nu" "$name" "$(date '+%Y-%m-%d')" >> "$USERS_FILE"
+      write_xray_config "$DEST"
+      systemctl restart xray >/dev/null 2>&1
+      sleep 2
+      systemctl is-active --quiet xray || die "xray 重启失败, 凭据文件保留在 ${USERS_FILE}"
+      ok "已添加凭据: ${name}"
+      echo
+      echo -e "${G}$(user_vless_link "$nu" "$name")${N}"
+      echo
+      ;;
+    rm|del)
+      local key="${2:-}" line
+      [ -n "$key" ] || die "用法: proxy user rm <名字或UUID前缀>"
+      [ "$(wc -l < "$USERS_FILE")" -gt 1 ] || die "至少保留一条凭据, 不能删光"
+      line=$(find_user_line "$key")
+      [ -n "$line" ] || die "未找到凭据: ${key}"
+      grep -vxF "$line" "$USERS_FILE" > "${USERS_FILE}.tmp"
+      mv -f "${USERS_FILE}.tmp" "$USERS_FILE"
+      chmod 600 "$USERS_FILE"
+      write_xray_config "$DEST"
+      systemctl restart xray >/dev/null 2>&1
+      sleep 2
+      systemctl is-active --quiet xray || warn "xray 重启异常, 请检查: proxy logs"
+      ok "已吊销: $(echo "$line" | cut -d'|' -f2)  (该设备的旧链接立即失效)"
+      ;;
+    link)
+      local key="${2:-}" line
+      [ -n "$key" ] || die "用法: proxy user link <名字或UUID前缀>"
+      line=$(find_user_line "$key")
+      [ -n "$line" ] || die "未找到凭据: ${key}"
+      user_vless_link "$(echo "$line" | cut -d'|' -f1)" "$(echo "$line" | cut -d'|' -f2)"
+      echo
+      ;;
+    *)
+      echo
+      hr
+      echo -e "${M}设备凭据${N}  (每台设备一条, 丢设备可单独吊销)"
+      hr
+      printf '%-38s %-16s %s\n' "UUID" "名称" "添加日期"
+      while IFS='|' read -r u n d; do
+        [ -n "$u" ] || continue
+        printf '%-38s %-16s %s\n' "$u" "$n" "$d"
+      done < "$USERS_FILE"
+      echo
+      echo -e "${D}proxy user add <名字>     添加设备"
+      echo -e "proxy user link <名字>    取该设备的链接"
+      echo -e "proxy user rm <名字>      吊销该设备${N}"
+      echo
+      ;;
+  esac
+}
+
 cmd_reset(){
   need_root
   load_state || die "尚未安装"
   warn "重置会生成新的 UUID / 密钥 / hy2 密码, 所有客户端必须重新导入!"
   ask_yes "确认重置凭据?" || { info "已取消"; return 0; }
   UUID=""; PRIV=""; PUB=""; SID=""; HY2_PASS=""; OBFS_PASS=""; DEST=""
+  rm -f "$USERS_FILE"
   save_state
   info "重新生成凭据..."
   ensure_creds
@@ -1511,6 +1653,7 @@ menu(){
     echo "  6) 实时日志 (xray)"
     echo "  7) 实时日志 (hysteria2)"
     echo "  8) 线路体检 (出口 IP / PTR / 时间 / 客户端清单)"
+    echo "  a) 设备凭据 (多设备 UUID / 单独吊销)"
     echo "  9) 重置凭据 (换 UUID/密钥, 需重新导入)"
     echo "  u) 卸载"
     echo "  0) 退出"
@@ -1526,6 +1669,7 @@ menu(){
       6) cmd_logs xray ;;
       7) cmd_logs hy2 ;;
       8) cmd_audit ;;
+      a|A) cmd_user list ;;
       9) cmd_reset ;;
       u|U) cmd_uninstall ;;
       0|q|Q) exit 0 ;;
@@ -1536,7 +1680,7 @@ menu(){
 
 usage(){
   cat <<'USAGE'
-Proxy Node Installer v2
+Proxy Node Installer v3
 
 用法:
   bash setup-proxy.sh [命令]
@@ -1550,6 +1694,7 @@ Proxy Node Installer v2
   restart          重启 xray 与 hysteria2
   logs [xray|hy2]  实时日志
   audit [--dnsbl]  线路体检(出口 IP / PTR / 时间 / 客户端清单)
+  user [子命令]    多设备凭据: list(默认) / add <名字> / link <名字> / rm <名字>
   reset            重置凭据(会作废现有客户端)
   uninstall        卸载
   upgrade          升级 Xray 内核(危险, 默认不建议)
@@ -1580,6 +1725,7 @@ main(){
     restart)        cmd_restart ;;
     logs)           cmd_logs "${2:-xray}" ;;
     audit)          cmd_audit "${2:-}" ;;
+    user)           cmd_user "${2:-list}" "${3:-}" ;;
     reset)          cmd_reset ;;
     uninstall)      cmd_uninstall ;;
     upgrade)        cmd_upgrade ;;

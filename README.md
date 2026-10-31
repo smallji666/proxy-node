@@ -16,6 +16,7 @@
 | 证书固定 | Hysteria2 自签证书用 `pinSHA256` 固定指纹，客户端**不需要 `insecure`** |
 | 自动选伪装站 | 遍历候选站点，**用真实 REALITY 握手验证**通过才采用 |
 | 幂等安装 | 凭据持久化，重跑脚本不会重置 UUID，已有客户端不失效 |
+| 多设备凭据 | 每台设备一条 UUID，可单独吊销；丢手机不影响其他设备 |
 | 订阅生成 | 自动产出 `clash.yaml` / `singbox.json` / `base64` 通用订阅 / 原始链接 |
 | 端口跳跃 | Hysteria2 UDP 端口区间跳跃，绕开单端口 QoS |
 | 管理命令 | 安装后可用 `proxy` 打开菜单，或用子命令直接操作 |
@@ -59,11 +60,30 @@ proxy status         # 服务状态与监听端口
 proxy restart        # 重启 xray 与 hysteria2
 proxy logs           # 实时日志（proxy logs hy2 看 hysteria2）
 proxy audit          # 线路体检：出口 IP / PTR / 时间同步 / 客户端清单
+proxy user           # 设备凭据：list / add <名字> / link <名字> / rm <名字>
 proxy reset          # 重置凭据（会作废所有已导入客户端）
 proxy uninstall      # 卸载
 ```
 
 也可以继续用脚本本身：`bash /root/setup-proxy.sh info`
+
+---
+
+## 多设备凭据
+
+每台设备用独立 UUID，而不是全家共用一个：
+
+```bash
+proxy user                 # 列出所有凭据
+proxy user add iPhone      # 新增，直接打印这台设备的链接
+proxy user link iPhone     # 取回已有设备的链接
+proxy user rm iPhone       # 吊销，这条链接立即失效
+```
+
+好处是**丢设备时只吊销那一条**，其他设备不受影响。`proxy reset` 则是核弹，全部作废。
+
+凭据存在 `/etc/proxy-node/users.txt`（权限 600），格式 `UUID|名字|日期`。
+订阅文件取第一条凭据，所以删掉第一条时订阅会自动换用新的第一条，不会失效。
 
 ---
 
@@ -231,6 +251,7 @@ Xray 新版支持给 VLESS 头部加密（`"decryption": "mlkem768x25519plus.nat
 - 反垃圾库查询（`proxy audit --dnsbl`）**默认关闭**，因为它会把 IP 交给第三方 DNSBL，需要你显式开启
 - 敏感文件权限：`/etc/proxy-node/state.env` 600、`/root/proxy-info.txt` 600、Hysteria2 私钥 600
 - Hysteria2 使用自签证书 + 指纹固定，**不依赖 `insecure`**；订阅里带的是公钥指纹，不是私钥
+- 设备凭据独立存放于 `/etc/proxy-node/users.txt`（600），每条可单独吊销
 - systemd 单元启用沙箱：`NoNewPrivileges`、`PrivateTmp`、`ProtectHome`、`ProtectKernelTunables`、
   `RestrictAddressFamilies` 等，服务被攻破后能动手的范围被压到最小
 - 部署日志：`/var/log/proxy-deploy.log`
