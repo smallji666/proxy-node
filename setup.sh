@@ -794,20 +794,20 @@ setup_firewall(){
 # ---------------- 链接生成 ----------------
 gen_links(){
   VLESS_LINK="vless://${UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${NODE_NAME}-VLESS"
-  HY2_LINK="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}"
+  local hb="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}"
+  if [ -n "${HY2_HOP:-}" ]; then hb="${hb}&mport=${HY2_HOP}"; fi
+  if [ "$ENABLE_OBFS" = "1" ]; then
+    hb="${hb}&obfs=salamander&obfs-password=${OBFS_PASS}"
+  fi
   if [ -n "${HY2_PIN:-}" ]; then
     # base64 里的 + 在 query 中会被解析成空格, 必须转义; / 和 = 在 query 值里合法
-    HY2_LINK="${HY2_LINK}&pinSHA256=${HY2_PIN//+/%2B}"
+    HY2_LINK="${hb}&pinSHA256=${HY2_PIN//+/%2B}#${NODE_NAME}-HY2"
+    # v2rayN 7.x 不识别 pinSHA256(二进制中无此字符串), 只认 insecure, 故单独给一条兼容链接
+    HY2_LINK_COMPAT="${hb}&insecure=1#${NODE_NAME}-HY2-v2rayN"
   else
-    HY2_LINK="${HY2_LINK}&insecure=1"
+    HY2_LINK="${hb}&insecure=1#${NODE_NAME}-HY2"
+    HY2_LINK_COMPAT=""
   fi
-  if [ -n "${HY2_HOP:-}" ]; then
-    HY2_LINK="${HY2_LINK}&mport=${HY2_HOP}"
-  fi
-  if [ "$ENABLE_OBFS" = "1" ]; then
-    HY2_LINK="${HY2_LINK}&obfs=salamander&obfs-password=${OBFS_PASS}"
-  fi
-  HY2_LINK="${HY2_LINK}#${NODE_NAME}-HY2"
 }
 
 # ---------------- 订阅文件 ----------------
@@ -925,9 +925,15 @@ EOF
 
 | 客户端 | 怎么填 |
 |---|---|
-| v2rayN / 小火箭 / v2rayNG | 直接用带 pinSHA256 的链接, 无需额外设置 |
-| sing-box | tls.certificate_public_key_sha256 填 SPKI 那行 |
-| mihomo / Clash Verge | skip-cert-verify: false, fingerprint 填 hex 那行 |
+| sing-box | tls.certificate_public_key_sha256 填 SPKI 那行, 真固定 |
+| mihomo / Clash Verge | skip-cert-verify: false + fingerprint 填 hex 那行, 真固定 |
+| hysteria2 官方客户端 / 小火箭 | 用带 pinSHA256 的链接 |
+| v2rayN 7.x | **不识别 pinSHA256**, 只能用下面的兼容链接 |
+
+v2rayN 的 Hysteria2 界面只有"跳过证书验证"一个勾选框, 没有指纹字段。
+想真正固定指纹, 请用 Clash Verge Rev 或 sing-box。v2rayN 兼容链接(无身份验证):
+
+${HY2_LINK_COMPAT:-当前未生成}
 
 指纹 pinSHA256 (hysteria2 链接里已带):
 ${HY2_PIN:-未启用, 当前为 insecure}
@@ -1047,6 +1053,11 @@ print_links(){
   [ "$ENABLE_OBFS" = "1" ] && echo "混淆      : salamander / ${OBFS_PASS}"
   echo
   echo -e "${G}${HY2_LINK}${N}"
+  if [ -n "${HY2_LINK_COMPAT:-}" ]; then
+    echo
+    echo -e "${D}v2rayN 不识别 pinSHA256, 请改用下面这条(无身份验证):${N}"
+    echo -e "${D}${HY2_LINK_COMPAT}${N}"
+  fi
   echo
 }
 
@@ -1191,6 +1202,7 @@ cmd_install(){
     [ -n "${HY2_HOP:-}" ] && echo "端口跳跃 : ${HY2_HOP}"
     [ "$ENABLE_OBFS" = "1" ] && echo "混淆     : salamander / ${OBFS_PASS}"
     echo "链接     : ${HY2_LINK}"
+    [ -n "${HY2_LINK_COMPAT:-}" ] && echo "v2rayN用 : ${HY2_LINK_COMPAT}  (v2rayN 不识别 pinSHA256, 此条无身份验证)"
     echo
     echo "[管理]"
     echo "proxy info | sub | status | restart | logs | reset | uninstall"

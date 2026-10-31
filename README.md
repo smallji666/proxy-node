@@ -188,8 +188,10 @@ Hysteria2 基于 QUIC，必须走完整 TLS 握手，所以需要一张证书；
 | sing-box | `tls.certificate_public_key_sha256` |
 | mihomo / Clash | `skip-cert-verify: false` + `fingerprint` |
 
-> 注意：v2rayN 的 Hysteria2 界面只有"跳过证书验证"一个勾选框，没有指纹字段。
-> 想用固定指纹又要图形化配置，选 Clash Verge Rev（mihomo 支持 `fingerprint`）。
+> 注意：v2rayN 7.x 的 Hysteria2 界面只有"跳过证书验证"一个勾选框，没有指纹字段，
+> 链接里的 `pinSHA256` 会被它忽略（7.24 二进制中查无此参数）。所以脚本会**额外打印一条
+> v2rayN 兼容链接**（带 `insecure=1`），导入后能连但拿不到身份验证。
+> 想真正固定指纹，用 Clash Verge Rev（mihomo 支持 `fingerprint`）或 sing-box。
 
 ### 伪装目标站黑名单
 
