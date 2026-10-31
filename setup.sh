@@ -8,6 +8,8 @@
 #  用法:
 #     bash setup-proxy.sh              首次=自动安装, 已装=打开管理菜单
 #     bash setup-proxy.sh install      直接安装(幂等, 不重置凭据)
+#     bash setup-proxy.sh install --clean  清理旧实例后全新安装(端口冲突用)
+#     bash setup-proxy.sh fresh        等同 install --clean
 #     bash setup-proxy.sh info         查看节点信息与链接
 #     bash setup-proxy.sh sub          重新生成订阅文件
 #     bash setup-proxy.sh status       服务状态
@@ -32,7 +34,7 @@
 set -uo pipefail
 
 APP_NAME="proxy"
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 STATE_DIR="/etc/proxy-node"
 STATE_FILE="${STATE_DIR}/state.env"
 USERS_FILE="${STATE_DIR}/users.txt"
@@ -1286,19 +1288,22 @@ cmd_install(){
   install_deps
   preflight
 
-  if [ "$CLEAN" = "1" ]; then
-    info "CLEAN=1: 先清理旧实例再安装"
-    do_clean 0
+  # 清理决策内嵌在安装流程里: 正常安装→默认幂等; 残缺安装→主动问清理
+  if ! install_clean_gate "$([ "$fresh" = "1" ] && echo 0 || echo 1)"; then
     # 清掉内存里的旧凭据, 否则会"复用"刚删掉的那套
     UUID=""; PRIV=""; PUB=""; SID=""; DEST=""
     HY2_PASS=""; OBFS_PASS=""; SUB_TOKEN=""; SERVER_IP=""
+    HY2_PIN=""; CERT_SPKI_B64=""; CERT_DER_B64=""; CERT_HEX=""
     fresh=1
   fi
 
-  if [ "$fresh" = "1" ]; then
-    local owner=""
-    owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
-    if [ -n "$owner" ]; then
+  # 端口占用: 清理后仍被占 = 外部进程; 已安装状态被占 = 可能是别人抢了端口
+  local owner=""
+  owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
+  if [ -n "$owner" ]; then
+    if [ "$fresh" = "0" ] && echo "$owner" | grep -qE '^(xray|hysteria)'; then
+      info "TCP ${VLESS_PORT} 由本服务自身监听, 继续"
+    else
       warn "TCP ${VLESS_PORT} 已被占用: ${owner}"
       ss -tlnp 2>/dev/null | awk -v p=":${VLESS_PORT}" '$4 ~ (p "$")'
       echo
@@ -1314,7 +1319,7 @@ cmd_install(){
         fi
       fi
       if port_in_use "$VLESS_PORT" tcp; then
-        die "端口仍被占用。可执行 bash setup-proxy.sh clean 清理, 或换端口: VLESS_PORT=8443 bash setup-proxy.sh install"
+        die "端口仍被占用。重装试试: bash $(basename "$0") install --clean; 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
       fi
     fi
   fi
@@ -1338,7 +1343,13 @@ cmd_install(){
   write_xray_config "$DEST"
   systemctl restart xray >/dev/null 2>&1
   sleep 2
-  systemctl is-active --quiet xray || die "xray 启动失败, 查看: journalctl -u xray -n 30 --no-pager"
+  if ! systemctl is-active --quiet xray; then
+    owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
+    if [ -n "$owner" ]; then
+      die "Xray 启动失败: TCP ${VLESS_PORT} 被 ${owner} 占用。执行 bash $(basename "$0") install --clean 清理后重装, 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
+    fi
+    die "Xray 启动失败, 查看: journalctl -u xray -n 30 --no-pager"
+  fi
   ok "Xray 运行中: TCP ${VLESS_PORT}, 伪装目标 ${DEST}"
 
   ensure_hy2
@@ -1836,13 +1847,76 @@ cmd_upgrade(){
 
 # ---------------- 清理 ----------------
 # 只删本脚本创建的东西; remove_script=1 时连管理命令与脚本一起删
+# 列出旧实例残留项; 有残留返回 0 并把清单打到 stdout
+residue_report(){
+  local found=0 out=""
+  [ -f /etc/systemd/system/xray.service ]            && { out+="    - systemd: xray.service"$'\n'; found=1; }
+  [ -f /etc/systemd/system/hysteria-server.service ] && { out+="    - systemd: hysteria-server.service"$'\n'; found=1; }
+  [ -f /etc/systemd/system/hy2-hop.service ]         && { out+="    - systemd: hy2-hop.service"$'\n'; found=1; }
+  [ -f /etc/systemd/system/proxy-sub.service ]       && { out+="    - systemd: proxy-sub.service"$'\n'; found=1; }
+  [ -f /etc/systemd/system/proxy-healthcheck.timer ] && { out+="    - systemd: proxy-healthcheck.timer"$'\n'; found=1; }
+  [ -x "$XRAY_BIN" ]                                 && { out+="    - 二进制: $XRAY_BIN"$'\n'; found=1; }
+  [ -x "$HY2_BIN" ]                                  && { out+="    - 二进制: $HY2_BIN"$'\n'; found=1; }
+  [ -d /usr/local/etc/xray ]                         && { out+="    - 配置: /usr/local/etc/xray"$'\n'; found=1; }
+  [ -d /etc/hysteria ]                               && { out+="    - 配置: /etc/hysteria"$'\n'; found=1; }
+  [ -d "$STATE_DIR" ]                                && { out+="    - 状态: $STATE_DIR"$'\n'; found=1; }
+  [ -d "$SUB_DIR" ]                                  && { out+="    - 订阅: $SUB_DIR"$'\n'; found=1; }
+  [ "$found" = "0" ] && return 1
+  printf '%s' "$out"
+  return 0
+}
+
+# 安装前的清理闸门, 内嵌在 install 流程里, 不需要单独跑 clean
+# $1: 1=状态文件可读(正常安装过) 0=状态缺失
+# 返回 0=直接继续, 1=已清理(调用方要重置内存凭据并按全新安装处理)
+install_clean_gate(){
+  local state_ok="${1:-0}" items=""
+
+  if [ "$CLEAN" = "1" ]; then
+    info "CLEAN=1 / --clean: 先清理旧实例再安装"
+    do_clean 0
+    return 1
+  fi
+
+  # 正常安装(状态可读): 原地幂等重部署, 不弹菜单打扰
+  if [ "$state_ok" = "1" ]; then
+    info "如需全新安装(换凭据/清端口), 加 --clean 参数重跑"
+    return 0
+  fi
+
+  # 状态缺失但有残留文件 = 上次装到一半的残缺安装, 不清理必然端口冲突
+  items=$(residue_report) || return 0
+
+  echo
+  warn "检测到残缺安装的残留文件:"
+  printf '%s' "$items"
+  echo
+
+  if [ "$ASSUME_YES" = "1" ] || ! ( : </dev/tty ) 2>/dev/null; then
+    warn "非交互模式: 自动清理残缺安装"
+    do_clean 0
+    return 1
+  fi
+
+  if ask_yes "清理这些残留并全新安装?"; then
+    do_clean 0
+    return 1
+  fi
+  die "已取消。加 --clean 参数重跑即可自动清理: bash setup-proxy.sh install --clean"
+}
+
 do_clean(){
   local remove_script="${1:-0}" hop="" hp="" p o
+  local vport="" hport=""
 
-  # 状态目录随后就被删, 先把端口跳跃信息读出来
-  if load_state 2>/dev/null; then
-    hop="${HY2_HOP:-}"
-    hp="${HY2_PORT:-}"
+  # 端口跳跃信息随后就被删掉, 先取出来
+  # 注意: 不能在这里 source state.env, 会把命令行传入的 VLESS_PORT 等环境变量覆盖回旧值
+  if [ -f "$STATE_FILE" ]; then
+    [ -n "$hop" ] || hop=$(sed -n "s/^HY2_HOP='\(.*\)'\$/\1/p" "$STATE_FILE" 2>/dev/null | head -1)
+    [ -n "$hp" ]  || hp=$(sed -n "s/^HY2_PORT='\(.*\)'\$/\1/p" "$STATE_FILE" 2>/dev/null | head -1)
+    # 复查端口用旧配置的端口, 比内存里的更准
+    [ -n "$vport" ] || vport=$(sed -n "s/^VLESS_PORT='\(.*\)'\$/\1/p" "$STATE_FILE" 2>/dev/null | head -1)
+    [ -n "$hport" ] || hport=$(sed -n "s/^HY2_PORT='\(.*\)'\$/\1/p" "$STATE_FILE" 2>/dev/null | head -1)
   fi
 
   systemctl disable --now xray hysteria-server hy2-hop proxy-sub proxy-healthcheck.timer >/dev/null 2>&1 || true
@@ -1879,7 +1953,7 @@ do_clean(){
   fi
 
   # 复查端口是否真的空了
-  for p in "${VLESS_PORT:-443}" "${HY2_PORT:-443}"; do
+  for p in "${vport:-${VLESS_PORT:-443}}" "${hport:-${HY2_PORT:-443}}"; do
     o=$(port_owner "$p" tcp) || o=""
     [ -n "$o" ] && warn "TCP ${p} 仍被其它进程占用: ${o}"
     o=$(port_owner "$p" udp) || o=""
@@ -1947,6 +2021,7 @@ menu(){
     echo "  a) 设备凭据 (多设备 UUID / 单独吊销)"
     echo "  9) 重置凭据 (换 UUID/密钥, 需重新导入)"
     echo "  b) 备份配置 (迁移到新 VPS 用)"
+    echo "  f) 清理并全新安装 (换新凭据, 端口冲突时用)"
     echo "  c) 清除所有配置 (端口被占用时用这个)"
     echo "  u) 卸载 (等同清除)"
     echo "  0) 退出"
@@ -1965,6 +2040,7 @@ menu(){
       a|A) cmd_user list ;;
       9) cmd_reset ;;
       b|B) cmd_backup ;;
+      f|F) CLEAN=1; cmd_install ;;
       c|C) cmd_clean ;;
       u|U) cmd_clean ;;
       0|q|Q) exit 0 ;;
@@ -1983,6 +2059,8 @@ Proxy Node Installer v3
 命令:
   (无参数)         首次=自动安装, 已安装=打开管理菜单
   install          安装/重新部署(幂等, 保留凭据)
+  install --clean  清理旧实例后全新安装(换新凭据, 端口冲突时用)
+  fresh            等同 install --clean
   info             查看节点信息、链接、二维码
   sub              重新生成订阅文件
   status           服务状态与监听端口
@@ -2010,7 +2088,7 @@ Proxy Node Installer v3
 
 示例:
   bash setup-proxy.sh
-  CLEAN=1 bash setup-proxy.sh install          端口被占用时一条命令重来
+  bash setup-proxy.sh install --clean         端口被占用时一条命令重来
   bash setup-proxy.sh clean --all             连管理命令一起删干净
   VLESS_PORT=8443 HY2_PORT=8443 bash setup-proxy.sh install
   ENABLE_OBFS=1 HY2_HOP=20000-30000 bash setup-proxy.sh install
@@ -2020,7 +2098,15 @@ USAGE
 # ---------------- 入口 ----------------
 main(){
   case "${1:-}" in
-    install)        cmd_install ;;
+    install)
+      shift || true
+      local a
+      for a in "$@"; do
+        case "$a" in --clean|--fresh|-c) CLEAN=1 ;; esac
+      done
+      cmd_install
+      ;;
+    fresh)          CLEAN=1; cmd_install ;;
     info)           cmd_info ;;
     sub)            cmd_sub ;;
     status)         cmd_status ;;

@@ -17,7 +17,7 @@
 | 自动选伪装站 | 遍历候选站点，**用真实 REALITY 握手验证**通过才采用 |
 | 幂等安装 | 凭据持久化，重跑脚本不会重置 UUID，已有客户端不失效 |
 | 多设备凭据 | 每台设备一条 UUID，可单独吊销；丢手机不影响其他设备 |
-| 一键清理 | `proxy clean` 停服务、删配置、清 iptables/sysctl、杀残留进程，端口被占用时一条命令重来 |
+| 一键清理 | 清理内嵌在安装流程：`install --clean` 一步清理重装，残缺安装自动识别；也可 `proxy clean` 单独清 |
 | 备份迁移 | `proxy backup` 打包凭据与证书，换 VPS 时 `restore` 直接沿用，不用重新导入客户端 |
 | 隧道自检 | 健康检查每 30 分钟真跑一次 REALITY 握手，连续失败才重启，避免误杀 |
 | 订阅生成 | 自动产出 `clash.yaml` / `singbox.json` / `base64` 通用订阅 / 原始链接 |
@@ -67,7 +67,8 @@ proxy user           # 设备凭据：list / add <名字> / link <名字> / rm <
 proxy reset          # 重置凭据（会作废所有已导入客户端）
 proxy backup         # 打包凭据与证书（迁移用）
 proxy restore <文件> # 从备份恢复
-proxy clean          # 清除所有配置与服务（端口被占用时用这个）
+proxy install --clean # 清理旧实例后全新安装（端口冲突时用这个）
+proxy clean          # 只清理不安装，保留 proxy 命令
 proxy upgrade 26.3.27  # 装指定版本；proxy upgrade --rollback 回滚上一版
 ```
 
@@ -97,16 +98,27 @@ proxy user rm iPhone       # 吊销，这条链接立即失效
 
 重装最常卡在端口上：上次的服务没停干净，或者 `/etc/proxy-node` 删了但进程还在跑。
 
-三条路，按顺序试：
+清理已经内嵌进安装流程，不用先手动清：
 
 ```bash
-# 1. 交互清理：安装时检测到占用会问你要不要清掉
-bash setup-proxy.sh install
+bash setup-proxy.sh install            # 正常重装：幂等，凭据不变
+bash setup-proxy.sh install --clean    # 清理旧实例后全新安装（换新凭据）
+bash setup-proxy.sh fresh              # 同上，短写法
+```
 
-# 2. 一条命令先清干净再装（无人值守）
-CLEAN=1 bash setup-proxy.sh install
+`install` 会先做一次残留检测，分三种情况：
 
-# 3. 只清理，不装
+| 机器状态 | 行为 |
+|---|---|
+| 有 `state.env`（正常装过） | 直接原地重部署，只提示一句“要全新安装请加 `--clean`”，不打扰 |
+| 无 `state.env` 但有残留文件 | 判定为残缺安装，列清单并问是否清理；`ASSUME_YES=1` 或无 tty 时自动清理 |
+| 完全没有残留 | 全新安装 |
+
+端口真被外部进程占着时，会报出占用者名字并问你：是清掉本脚本的残留实例，还是结束那个进程，或者换端口。
+
+菜单里也有对应入口：`f) 清理并全新安装`。只想清不装：
+
+```bash
 proxy clean            # 保留 proxy 命令，方便随后重装
 proxy clean --all      # 连管理命令和脚本一起删
 ```
@@ -171,7 +183,7 @@ proxy audit --dnsbl    # 额外查反垃圾库（会把 IP 提交给 Spamhaus）
 | `SUB_BIND` | `127.0.0.1` | 订阅服务监听地址；改成 `0.0.0.0` 才会对公网开放 |
 | `NODE_NAME` | `Node` | 节点名（订阅与链接里的显示名） |
 | `XRAY_VERSION` | `26.3.27` | Xray 版本，**不建议改动**，见下文 |
-| `CLEAN` | `0` | `1` 安装前先彻底清理旧实例 |
+| `CLEAN` | `0` | `1` 安装前先彻底清理旧实例（等同 `install --clean`） |
 | `ASSUME_YES` | `0` | `1` 全程不询问 |
 
 示例：
