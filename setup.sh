@@ -22,7 +22,9 @@
 #     bash setup-proxy.sh uninstall    卸载(等同 clean)
 #     bash setup-proxy.sh upgrade [版本]  升级内核, --rollback 回滚
 #  环境变量(首次安装生效):
+#     PROTOCOLS=reality,hy2   协议组合(可选 reality hy2 ss2022 anytls tuic)
 #     VLESS_PORT=443  HY2_PORT=443  REALITY_DEST=www.bing.com
+#     SS2022_PORT=8445  ANYTLS_PORT=8444  TUIC_PORT=8443
 #     ENABLE_OBFS=1   开启 hy2 salamander 混淆
 #     HY2_HOP=20000-30000   hy2 UDP 端口跳跃
 #     HY2_INSECURE=1  关闭证书固定, 退回 insecure (不推荐, 仅临时调试)
@@ -34,7 +36,7 @@
 set -uo pipefail
 
 APP_NAME="proxy"
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="4.0.0"
 STATE_DIR="/etc/proxy-node"
 STATE_FILE="${STATE_DIR}/state.env"
 USERS_FILE="${STATE_DIR}/users.txt"
@@ -56,6 +58,11 @@ _RAW_SUB_HTTP="${SUB_HTTP-__unset__}"
 _RAW_SUB_PORT="${SUB_PORT-__unset__}"
 _RAW_SUB_BIND="${SUB_BIND-__unset__}"
 _RAW_NODE_NAME="${NODE_NAME-__unset__}"
+_RAW_PROTOCOLS="${PROTOCOLS-__unset__}"
+_RAW_SS2022_PORT="${SS2022_PORT-__unset__}"
+_RAW_ANYTLS_PORT="${ANYTLS_PORT-__unset__}"
+_RAW_TUIC_PORT="${TUIC_PORT-__unset__}"
+_RAW_WARP="${WARP-__unset__}"
 
 # ---------------- 默认参数 ----------------
 VLESS_PORT="${VLESS_PORT:-443}"
@@ -72,11 +79,22 @@ CLEAN="${CLEAN:-0}"
 NODE_NAME="${NODE_NAME:-Node}"
 NODE_NAME="${NODE_NAME// /-}"
 ASSUME_YES="${ASSUME_YES:-0}"
+# 协议组合, 逗号分隔. 默认与旧版行为一致(reality + hy2)
+PROTOCOLS="${PROTOCOLS:-reality,hy2}"
+SS2022_PORT="${SS2022_PORT:-8445}"
+ANYTLS_PORT="${ANYTLS_PORT:-8444}"
+TUIC_PORT="${TUIC_PORT:-8443}"
+WARP="${WARP:-0}"
 
 XRAY_BIN=/usr/local/bin/xray
 XRAY_CFG=/usr/local/etc/xray/config.json
 HY2_BIN=/usr/local/bin/hysteria
 HY2_CFG=/etc/hysteria/config.yaml
+SB_BIN=/usr/local/bin/sing-box
+SB_CFG=/etc/sing-box/config.json
+SB_CERT=/etc/sing-box/cert.pem
+SB_KEY=/etc/sing-box/key.pem
+SB_DIR=/etc/sing-box
 
 # ---------------- 样式 ----------------
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;36m'
@@ -94,6 +112,35 @@ die(){  err "$*"; echo; err "部署中止。完整日志: ${LOG_FILE}"; exit 1; 
 hr(){ echo -e "${D}------------------------------------------------------------${N}"; }
 
 need_root(){ [ "$(id -u)" -eq 0 ] || die "请用 root 运行"; }
+
+# 协议开关: proto_on reality / proto_on ss2022 ...
+proto_on(){
+  case ",${PROTOCOLS}," in
+    *",$1,"*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+# 规范化协议列表: 去空格, 去重, 校验合法性
+normalize_protocols(){
+  local raw="${1:-}" out="" p
+  raw="${raw// /}"; raw="${raw//;/,}"
+  local IFS=','
+  for p in $raw; do
+    [ -n "$p" ] || continue
+    case "$p" in
+      reality|hy2|ss2022|anytls|tuic) ;;
+      *) die "未知协议: ${p} (可选: reality hy2 ss2022 anytls tuic)" ;;
+    esac
+    case ",${out}," in
+      *",$p,"*) ;;
+      *) out="${out:+${out},}${p}" ;;
+    esac
+  done
+  unset IFS
+  [ -n "$out" ] || die "PROTOCOLS 不能为空"
+  PROTOCOLS="$out"
+}
 
 # version_ge A B  ->  A >= B (按版本号而非字符串比较)
 version_ge(){
@@ -145,6 +192,17 @@ save_state(){
     echo "SUB_PORT='${SUB_PORT:-}'"
     echo "SUB_BIND='${SUB_BIND}'"
     echo "SUB_HTTP='${SUB_HTTP}'"
+    echo "PROTOCOLS='${PROTOCOLS}'"
+    echo "SS2022_PORT='${SS2022_PORT}'"
+    echo "ANYTLS_PORT='${ANYTLS_PORT}'"
+    echo "TUIC_PORT='${TUIC_PORT}'"
+    echo "SS2022_PASS='${SS2022_PASS:-}'"
+    echo "ANYTLS_PASS='${ANYTLS_PASS:-}'"
+    echo "TUIC_PASS='${TUIC_PASS:-}'"
+    echo "TUIC_UUID='${TUIC_UUID:-}'"
+    echo "SB_PIN='${SB_PIN:-}'"
+    echo "SB_HEX='${SB_HEX:-}'"
+    echo "WARP='${WARP}'"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
@@ -160,6 +218,11 @@ apply_env_overrides(){
   [ "$_RAW_SUB_HTTP"     != "__unset__" ] && SUB_HTTP="$_RAW_SUB_HTTP"
   [ "$_RAW_SUB_PORT"     != "__unset__" ] && SUB_PORT="$_RAW_SUB_PORT"
   [ "$_RAW_SUB_BIND"     != "__unset__" ] && SUB_BIND="$_RAW_SUB_BIND"
+  [ "$_RAW_PROTOCOLS"    != "__unset__" ] && PROTOCOLS="$_RAW_PROTOCOLS"
+  [ "$_RAW_SS2022_PORT"  != "__unset__" ] && SS2022_PORT="$_RAW_SS2022_PORT"
+  [ "$_RAW_ANYTLS_PORT"  != "__unset__" ] && ANYTLS_PORT="$_RAW_ANYTLS_PORT"
+  [ "$_RAW_TUIC_PORT"    != "__unset__" ] && TUIC_PORT="$_RAW_TUIC_PORT"
+  [ "$_RAW_WARP"         != "__unset__" ] && WARP="$_RAW_WARP"
   if [ "$_RAW_NODE_NAME" != "__unset__" ]; then
     NODE_NAME="${_RAW_NODE_NAME// /-}"
   fi
@@ -640,6 +703,224 @@ UNIT
   fi
 }
 
+# ---------------- sing-box 内核: ss2022 / anytls / tuic ----------------
+# 这三个协议由同一个 sing-box 进程承载, 端口各自独立, 共用一份自签证书
+SB_VERSION="${SB_VERSION:-1.14.4}"
+
+sb_enabled(){ proto_on ss2022 || proto_on anytls || proto_on tuic; }
+
+sb_port_summary(){
+  local p=""
+  proto_on ss2022 && p="${p} SS2022/${SS2022_PORT}"
+  proto_on anytls && p="${p} AnyTLS/${ANYTLS_PORT}"
+  proto_on tuic   && p="${p} TUIC/${TUIC_PORT}"
+  echo "${p# }"
+}
+
+ensure_singbox(){
+  sb_enabled || return 0
+  local arch asset tmp bin
+  case "$(uname -m)" in
+    x86_64|amd64)  arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) die "不支持的架构: $(uname -m)" ;;
+  esac
+  asset="sing-box-${SB_VERSION}-linux-${arch}.tar.gz"
+
+  if [ -x "$SB_BIN" ] && "$SB_BIN" version 2>/dev/null | grep -qF "$SB_VERSION"; then
+    ok "sing-box v${SB_VERSION} 已安装, 跳过"
+    return 0
+  fi
+
+  info "下载 sing-box v${SB_VERSION} ..."
+  tmp=$(mktemp -d)
+  download_with_mirror \
+    "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/${asset}" \
+    "$tmp/sb.tar.gz" || die "sing-box 下载失败(检查服务器能否访问 GitHub)"
+  tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || die "sing-box 解压失败"
+  bin=$(find "$tmp" -type f -name sing-box 2>/dev/null | head -1)
+  [ -n "$bin" ] || die "压缩包内未找到 sing-box"
+  systemctl stop sing-box >/dev/null 2>&1 || true
+  install -m 755 "$bin" "$SB_BIN"
+  rm -rf "$tmp"
+  mkdir -p "$SB_DIR"; chmod 700 "$SB_DIR"
+  ok "sing-box 已安装: $($SB_BIN version 2>/dev/null | head -1)"
+}
+
+ensure_sb_cert(){
+  sb_enabled || return 0
+  mkdir -p "$SB_DIR"; chmod 700 "$SB_DIR"
+  local cn="${DEST:-www.bing.com}"
+  if [ ! -f "$SB_CERT" ] || [ ! -f "$SB_KEY" ]; then
+    openssl ecparam -genkey -name prime256v1 -out "$SB_KEY" 2>/dev/null \
+      || die "sing-box 证书私钥生成失败"
+    openssl req -new -x509 -days 3650 -key "$SB_KEY" -out "$SB_CERT" \
+      -subj "/CN=${cn}" 2>/dev/null || die "sing-box 证书生成失败"
+  fi
+  chmod 600 "$SB_KEY"; chmod 644 "$SB_CERT"
+  SB_PIN=$(openssl x509 -in "$SB_CERT" -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform der 2>/dev/null \
+    | openssl dgst -sha256 -binary | openssl base64 -A)
+  SB_HEX=$(openssl x509 -in "$SB_CERT" -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
+  [ -n "$SB_PIN" ] || warn "sing-box 证书指纹计算失败, 客户端将无法固定校验"
+}
+
+# 由 UUID 无状态派生密码: 不额外占状态字段, 换 UUID 即换密码
+derive_hex(){
+  printf '%s' "$1" | openssl dgst -sha256 -hex 2>/dev/null | sed 's/^.*= *//' | cut -c1-32
+}
+
+# SS2022 要求 base64 编码的 16 字节密钥
+derive_ss_key(){
+  printf '%s' "$1" | openssl dgst -sha256 -binary 2>/dev/null | head -c 16 | openssl base64 -A
+}
+
+ensure_sb_creds(){
+  sb_enabled || return 0
+  [ -n "${SS2022_PASS:-}" ] || SS2022_PASS=$(openssl rand -base64 16)
+  [ -n "${ANYTLS_PASS:-}" ] || ANYTLS_PASS=$(openssl rand -hex 16)
+  [ -n "${TUIC_PASS:-}" ]   || TUIC_PASS=$(openssl rand -hex 16)
+  [ -n "${TUIC_UUID:-}" ]   || TUIC_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
+}
+
+# 生成 sing-box users 数组. kind: tuic | anytls | ss
+sb_users_json(){
+  local kind="$1" out="" u name
+  if [ -f "$USERS_FILE" ]; then
+    while IFS='|' read -r u name _; do
+      [ -n "$u" ] || continue
+      case "$kind" in
+        tuic)   out="${out}{\"uuid\":\"${u}\",\"password\":\"$(derive_hex "$u")\"}," ;;
+        anytls) out="${out}{\"name\":\"${name}\",\"password\":\"$(derive_hex "$u")\"}," ;;
+        ss)     out="${out}{\"name\":\"${name}\",\"password\":\"$(derive_ss_key "$u")\"}," ;;
+      esac
+    done < "$USERS_FILE"
+  fi
+  if [ -z "$out" ]; then
+    case "$kind" in
+      tuic)   out="{\"uuid\":\"${TUIC_UUID}\",\"password\":\"${TUIC_PASS}\"}," ;;
+      anytls) out="{\"name\":\"default\",\"password\":\"${ANYTLS_PASS}\"}," ;;
+      ss)     out="{\"name\":\"default\",\"password\":\"$(derive_ss_key "${TUIC_UUID:-default}")\"}," ;;
+    esac
+  fi
+  printf '[%s]' "${out%,}"
+}
+
+write_singbox_config(){
+  sb_enabled || return 0
+  local inbounds=() tls_h2 tls_h3
+
+  tls_h2=$(printf '{"enabled":true,"server_name":"%s","certificate_path":"%s","key_path":"%s","alpn":["h2","http/1.1"]}' \
+    "$DEST" "$SB_CERT" "$SB_KEY")
+  tls_h3=$(printf '{"enabled":true,"server_name":"%s","certificate_path":"%s","key_path":"%s","alpn":["h3"]}' \
+    "$DEST" "$SB_CERT" "$SB_KEY")
+
+  if proto_on ss2022; then
+    inbounds+=("$(cat <<JSON
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022-in",
+      "listen": "::",
+      "listen_port": ${SS2022_PORT},
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "${SS2022_PASS}",
+      "users": $(sb_users_json ss)
+    }
+JSON
+)")
+  fi
+
+  if proto_on anytls; then
+    inbounds+=("$(cat <<JSON
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${ANYTLS_PORT},
+      "users": $(sb_users_json anytls),
+      "tls": ${tls_h2}
+    }
+JSON
+)")
+  fi
+
+  if proto_on tuic; then
+    inbounds+=("$(cat <<JSON
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": ${TUIC_PORT},
+      "users": $(sb_users_json tuic),
+      "congestion_control": "bbr",
+      "tls": ${tls_h3}
+    }
+JSON
+)")
+  fi
+
+  [ ${#inbounds[@]} -gt 0 ] || die "sing-box 已启用但没有任何 inbound, 检查 PROTOCOLS"
+
+  {
+    echo "{"
+    echo '  "log": { "level": "warn", "timestamp": true },'
+    printf '  "inbounds": [\n%s\n  ],\n' "$(printf '%s,\n' "${inbounds[@]}" | sed '$ s/,$//')"
+    echo '  "outbounds": [ { "type": "direct", "tag": "direct" } ]'
+    echo "}"
+  } > "$SB_CFG"
+  chmod 600 "$SB_CFG"
+
+  if ! "$SB_BIN" check -c "$SB_CFG" >/tmp/_sbcheck.log 2>&1; then
+    err "sing-box 配置校验失败:"
+    sed -n '1,5p' /tmp/_sbcheck.log
+    rm -f /tmp/_sbcheck.log
+    die "请把上面几行发给我"
+  fi
+  rm -f /tmp/_sbcheck.log
+}
+
+ensure_singbox_service(){
+  sb_enabled || return 0
+  if [ ! -f /etc/systemd/system/sing-box.service ] \
+     || ! grep -q 'NoNewPrivileges=true' /etc/systemd/system/sing-box.service; then
+    cat > /etc/systemd/system/sing-box.service <<'UNIT'
+[Unit]
+Description=sing-box Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+  fi
+  systemctl enable sing-box >/dev/null 2>&1
+  systemctl restart sing-box >/dev/null 2>&1
+  sleep 2
+  systemctl is-active --quiet sing-box \
+    || die "sing-box 未能启动, 查看: journalctl -u sing-box -n 30 --no-pager"
+  ok "sing-box 运行中: $(sb_port_summary)"
+}
+
 # 自签证书的三种指纹表示, 对应不同客户端字段:
 #   SPKI 公钥 SHA-256 (base64) -> hysteria2 URI pinSHA256 / sing-box certificate_public_key_sha256
 #   整证书 SHA-256   (base64) -> 部分实现按整证书校验, 作为兜底
@@ -806,15 +1087,43 @@ TICK=/run/proxy-healthcheck.tick
 # shellcheck disable=SC1090
 . "$ST"
 
+PROTOCOLS=${PROTOCOLS:-reality,hy2}
+on(){
+  case ",${PROTOCOLS}," in
+    *",$1,"*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+sb_on(){ on ss2022 || on anytls || on tuic; }
+
 restart_xray(){
   systemctl restart xray >/dev/null 2>&1
   logger -t proxy-healthcheck "xray 异常($1), 已重启"
   echo 0 > "$FAIL" 2>/dev/null || true
 }
+restart_svc(){
+  systemctl restart "$1" >/dev/null 2>&1
+  logger -t proxy-healthcheck "$1 异常($2), 已重启"
+}
+listen_tcp(){ ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"; }
+listen_udp(){ ss -uln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"; }
 
-if ! systemctl is-active --quiet xray; then restart_xray "进程不在"; fi
-if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${VLESS_PORT}$"; then
-  restart_xray "端口未监听"
+if on reality; then
+  systemctl is-active --quiet xray || restart_xray "进程不在"
+  listen_tcp "${VLESS_PORT}" || restart_xray "端口未监听"
+fi
+if on hy2; then
+  systemctl is-active --quiet hysteria-server || restart_svc hysteria-server "进程不在"
+  listen_udp "${HY2_PORT}" || restart_svc hysteria-server "UDP 端口未监听"
+fi
+if sb_on; then
+  if ! systemctl is-active --quiet sing-box; then
+    restart_svc sing-box "进程不在"
+  else
+    on ss2022 && { listen_tcp "${SS2022_PORT}" || restart_svc sing-box "SS2022 端口未监听"; }
+    on anytls && { listen_tcp "${ANYTLS_PORT}" || restart_svc sing-box "AnyTLS 端口未监听"; }
+    on tuic   && { listen_udp "${TUIC_PORT}"   || restart_svc sing-box "TUIC 端口未监听"; }
+  fi
 fi
 
 n=$(cat "$TICK" 2>/dev/null || echo 0)
@@ -822,7 +1131,7 @@ case "$n" in ''|*[!0-9]*) n=0 ;; esac
 n=$(( n + 1 ))
 echo "$n" > "$TICK" 2>/dev/null || true
 
-if [ $(( n % 6 )) -eq 0 ]; then
+if on reality && [ $(( n % 6 )) -eq 0 ]; then
   U=$(head -1 /etc/proxy-node/users.txt 2>/dev/null | cut -d'|' -f1)
   U=${U:-${UUID:-}}
   if [ -n "$U" ] && [ -n "${DEST:-}" ]; then
@@ -854,11 +1163,6 @@ JSON
         ;;
     esac
   fi
-fi
-
-if ! systemctl is-active --quiet hysteria-server; then
-  systemctl restart hysteria-server >/dev/null 2>&1
-  logger -t proxy-healthcheck "hysteria2 异常, 已重启"
 fi
 HEALTH
   chmod 755 /usr/local/bin/proxy-healthcheck.sh
@@ -895,37 +1199,73 @@ UNIT
 }
 
 setup_firewall(){
+  local ports="" p
+  proto_on reality && ports="${ports} ${VLESS_PORT}/tcp"
+  proto_on hy2     && ports="${ports} ${HY2_PORT}/udp"
+  proto_on ss2022  && ports="${ports} ${SS2022_PORT}/tcp ${SS2022_PORT}/udp"
+  proto_on anytls  && ports="${ports} ${ANYTLS_PORT}/tcp"
+  proto_on tuic    && ports="${ports} ${TUIC_PORT}/tcp ${TUIC_PORT}/udp"
+  [ -n "$ports" ] || return 0
+
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${VLESS_PORT}/tcp" >/dev/null 2>&1
-    ufw allow "${HY2_PORT}/udp"  >/dev/null 2>&1
-    ok "ufw 已放行 ${VLESS_PORT}/tcp, ${HY2_PORT}/udp"
+    for p in $ports; do ufw allow "$p" >/dev/null 2>&1; done
+    ok "ufw 已放行:${ports}"
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="${VLESS_PORT}/tcp" >/dev/null 2>&1
-    firewall-cmd --permanent --add-port="${HY2_PORT}/udp"  >/dev/null 2>&1
+    for p in $ports; do firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1; done
     firewall-cmd --reload >/dev/null 2>&1
-    ok "firewalld 已放行"
+    ok "firewalld 已放行:${ports}"
   else
-    ok "本机防火墙未启用, 请确认云安全组已放行 TCP ${VLESS_PORT} / UDP ${HY2_PORT}"
+    ok "本机防火墙未启用, 请确认云安全组已放行:${ports}"
   fi
 }
 
 # ---------------- 链接生成 ----------------
 gen_links(){
   PRIMARY_UUID=$(primary_uuid)
-  VLESS_LINK="vless://${PRIMARY_UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${NODE_NAME}-VLESS"
-  local hb="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}"
-  if [ -n "${HY2_HOP:-}" ]; then hb="${hb}&mport=${HY2_HOP}"; fi
-  if [ "$ENABLE_OBFS" = "1" ]; then
-    hb="${hb}&obfs=salamander&obfs-password=${OBFS_PASS}"
+  VLESS_LINK=""; HY2_LINK=""; HY2_LINK_COMPAT=""
+  SS_LINK=""; ANYTLS_LINK=""; TUIC_LINK=""
+
+  if proto_on reality; then
+    VLESS_LINK="vless://${PRIMARY_UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${NODE_NAME}-VLESS"
   fi
-  if [ -n "${HY2_PIN:-}" ]; then
-    # base64 里的 + 在 query 中会被解析成空格, 必须转义; / 和 = 在 query 值里合法
-    HY2_LINK="${hb}&pinSHA256=${HY2_PIN//+/%2B}#${NODE_NAME}-HY2"
-    # v2rayN 7.x 不识别 pinSHA256(二进制中无此字符串), 只认 insecure, 故单独给一条兼容链接
-    HY2_LINK_COMPAT="${hb}&insecure=1#${NODE_NAME}-HY2-v2rayN"
-  else
-    HY2_LINK="${hb}&insecure=1#${NODE_NAME}-HY2"
-    HY2_LINK_COMPAT=""
+
+  if proto_on hy2; then
+    local hb="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}"
+    if [ -n "${HY2_HOP:-}" ]; then hb="${hb}&mport=${HY2_HOP}"; fi
+    if [ "$ENABLE_OBFS" = "1" ]; then
+      hb="${hb}&obfs=salamander&obfs-password=${OBFS_PASS}"
+    fi
+    if [ -n "${HY2_PIN:-}" ]; then
+      # base64 里的 + 在 query 中会被解析成空格, 必须转义; / 和 = 在 query 值里合法
+      HY2_LINK="${hb}&pinSHA256=${HY2_PIN//+/%2B}#${NODE_NAME}-HY2"
+      # v2rayN 7.x 不识别 pinSHA256(二进制中无此字符串), 只认 insecure, 故单独给一条兼容链接
+      HY2_LINK_COMPAT="${hb}&insecure=1#${NODE_NAME}-HY2-v2rayN"
+    else
+      HY2_LINK="${hb}&insecure=1#${NODE_NAME}-HY2"
+      HY2_LINK_COMPAT=""
+    fi
+  fi
+
+  # 以下三个协议用自签证书。URI 标准里没有证书指纹字段, 只能 insecure;
+  # 订阅配置(singbox.json)里才是真固定, 客户端指南会说明这一点。
+  if sb_enabled; then
+    local pu pn ss_ui
+    pu="$PRIMARY_UUID"
+    pn=$(awk -F'|' -v u="$pu" '$1==u{print $2; exit}' "$USERS_FILE" 2>/dev/null)
+    [ -n "$pn" ] || pn="default"
+
+    if proto_on ss2022; then
+      # SIP002: base64url(method:password), 去掉 padding
+      ss_ui=$(printf '2022-blake3-aes-128-gcm:%s' "$(derive_ss_key "$pu")" \
+        | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+      SS_LINK="ss://${ss_ui}@${SERVER_IP}:${SS2022_PORT}#${NODE_NAME}-SS2022"
+    fi
+    if proto_on anytls; then
+      ANYTLS_LINK="anytls://$(derive_hex "$pu")@${SERVER_IP}:${ANYTLS_PORT}?sni=${DEST}&insecure=1#${NODE_NAME}-AnyTLS"
+    fi
+    if proto_on tuic; then
+      TUIC_LINK="tuic://${pu}:$(derive_hex "$pu")@${SERVER_IP}:${TUIC_PORT}?sni=${DEST}&alpn=h3&congestion_control=bbr&allow_insecure=1#${NODE_NAME}-TUIC"
+    fi
   fi
 }
 
@@ -945,9 +1285,16 @@ HTML
   local tdir="${SUB_DIR}/${SUB_TOKEN}"
   mkdir -p "$tdir"; chmod 755 "$tdir"
 
-  printf '%s\n%s\n' "$VLESS_LINK" "$HY2_LINK" > "$tdir/links.txt"
+  local links=()
+  proto_on reality && links+=("$VLESS_LINK")
+  proto_on hy2     && links+=("$HY2_LINK")
+  proto_on ss2022  && links+=("$SS_LINK")
+  proto_on anytls  && links+=("$ANYTLS_LINK")
+  proto_on tuic    && links+=("$TUIC_LINK")
+  [ ${#links[@]} -gt 0 ] || die "没有任何可用协议, 检查 PROTOCOLS"
+  printf '%s\n' "${links[@]}" > "$tdir/links.txt"
 
-  { printf '%s\n%s\n' "$VLESS_LINK" "$HY2_LINK" | base64 -w0; echo ""; } > "$tdir/base64.txt"
+  { printf '%s\n' "${links[@]}" | base64 -w0; echo ""; } > "$tdir/base64.txt"
 
   {
     echo "mixed-port: 7890"
@@ -955,61 +1302,103 @@ HTML
     echo "mode: rule"
     echo "log-level: info"
     echo "proxies:"
-    echo "  - name: \"${NODE_NAME}-VLESS\""
-    echo "    type: vless"
-    echo "    server: ${SERVER_IP}"
-    echo "    port: ${VLESS_PORT}"
-    echo "    uuid: ${PRIMARY_UUID}"
-    echo "    network: tcp"
-    echo "    udp: true"
-    echo "    tls: true"
-    echo "    flow: xtls-rprx-vision"
-    echo "    servername: ${DEST}"
-    echo "    client-fingerprint: chrome"
-    echo "    reality-opts:"
-    echo "      public-key: ${PUB}"
-    echo "      short-id: ${SID}"
-    echo "  - name: \"${NODE_NAME}-HY2\""
-    echo "    type: hysteria2"
-    echo "    server: ${SERVER_IP}"
-    echo "    port: ${HY2_PORT}"
-    echo "    password: \"${HY2_PASS}\""
-    echo "    sni: ${DEST}"
-    if [ -n "${HY2_PIN:-}" ] && [ -n "${CERT_HEX:-}" ]; then
-      echo "    skip-cert-verify: false"
-      echo "    fingerprint: ${CERT_HEX}"
-    else
+    if proto_on reality; then
+      echo "  - name: \"${NODE_NAME}-VLESS\""
+      echo "    type: vless"
+      echo "    server: ${SERVER_IP}"
+      echo "    port: ${VLESS_PORT}"
+      echo "    uuid: ${PRIMARY_UUID}"
+      echo "    network: tcp"
+      echo "    udp: true"
+      echo "    tls: true"
+      echo "    flow: xtls-rprx-vision"
+      echo "    servername: ${DEST}"
+      echo "    client-fingerprint: chrome"
+      echo "    reality-opts:"
+      echo "      public-key: ${PUB}"
+      echo "      short-id: ${SID}"
+    fi
+    if proto_on hy2; then
+      echo "  - name: \"${NODE_NAME}-HY2\""
+      echo "    type: hysteria2"
+      echo "    server: ${SERVER_IP}"
+      echo "    port: ${HY2_PORT}"
+      echo "    password: \"${HY2_PASS}\""
+      echo "    sni: ${DEST}"
+      if [ -n "${HY2_PIN:-}" ] && [ -n "${CERT_HEX:-}" ]; then
+        echo "    skip-cert-verify: false"
+        echo "    fingerprint: ${CERT_HEX}"
+      else
+        echo "    skip-cert-verify: true"
+      fi
+      [ -n "${HY2_HOP:-}" ] && echo "    ports: \"${HY2_HOP}\""
+      if [ "$ENABLE_OBFS" = "1" ]; then
+        echo "    obfs: salamander"
+        echo "    obfs-password: \"${OBFS_PASS}\""
+      fi
+    fi
+    if proto_on ss2022; then
+      echo "  - name: \"${NODE_NAME}-SS2022\""
+      echo "    type: ss"
+      echo "    server: ${SERVER_IP}"
+      echo "    port: ${SS2022_PORT}"
+      echo "    cipher: 2022-blake3-aes-128-gcm"
+      echo "    password: \"$(derive_ss_key "$PRIMARY_UUID")\""
+      echo "    udp: true"
+    fi
+    if proto_on anytls; then
+      echo "  - name: \"${NODE_NAME}-AnyTLS\""
+      echo "    type: anytls"
+      echo "    server: ${SERVER_IP}"
+      echo "    port: ${ANYTLS_PORT}"
+      echo "    password: \"$(derive_hex "$PRIMARY_UUID")\""
+      echo "    sni: ${DEST}"
       echo "    skip-cert-verify: true"
     fi
-    [ -n "${HY2_HOP:-}" ] && echo "    ports: \"${HY2_HOP}\""
-    if [ "$ENABLE_OBFS" = "1" ]; then
-      echo "    obfs: salamander"
-      echo "    obfs-password: \"${OBFS_PASS}\""
+    if proto_on tuic; then
+      echo "  - name: \"${NODE_NAME}-TUIC\""
+      echo "    type: tuic"
+      echo "    server: ${SERVER_IP}"
+      echo "    port: ${TUIC_PORT}"
+      echo "    uuid: ${PRIMARY_UUID}"
+      echo "    password: \"$(derive_hex "$PRIMARY_UUID")\""
+      echo "    sni: ${DEST}"
+      echo "    alpn: [h3]"
+      echo "    congestion-controller: bbr"
+      echo "    skip-cert-verify: true"
     fi
     echo "proxy-groups:"
     echo "  - name: PROXY"
     echo "    type: select"
     echo "    proxies:"
-    echo "      - \"${NODE_NAME}-VLESS\""
-    echo "      - \"${NODE_NAME}-HY2\""
+    proto_on reality && echo "      - \"${NODE_NAME}-VLESS\""
+    proto_on hy2     && echo "      - \"${NODE_NAME}-HY2\""
+    proto_on ss2022  && echo "      - \"${NODE_NAME}-SS2022\""
+    proto_on anytls  && echo "      - \"${NODE_NAME}-AnyTLS\""
+    proto_on tuic    && echo "      - \"${NODE_NAME}-TUIC\""
     echo "rules:"
     echo "  - MATCH,PROXY"
   } > "$tdir/clash.yaml"
 
-  local sbox_hy2_tls
+  local ob=() first_tag="" sbox_hy2_tls="" sbox_anytls_tls="" sbox_tuic_tls=""
+
+  if [ -n "${SB_PIN:-}" ]; then
+    # 订阅里的 sing-box 配置是唯一能真正固定证书的地方
+    sbox_anytls_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"alpn\": [\"h2\", \"http/1.1\"], \"certificate_public_key_sha256\": [\"${SB_PIN}\"] }"
+    sbox_tuic_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"alpn\": [\"h3\"], \"certificate_public_key_sha256\": [\"${SB_PIN}\"] }"
+  else
+    sbox_anytls_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"alpn\": [\"h2\", \"http/1.1\"], \"insecure\": true }"
+    sbox_tuic_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"alpn\": [\"h3\"], \"insecure\": true }"
+  fi
   if [ -n "${HY2_PIN:-}" ] && [ -n "${CERT_SPKI_B64:-}" ]; then
     sbox_hy2_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"certificate_public_key_sha256\": [\"${CERT_SPKI_B64}\"] }"
   else
     sbox_hy2_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"insecure\": true }"
   fi
 
-  cat > "$tdir/singbox.json" <<EOF
-{
-  "log": { "level": "info" },
-  "inbounds": [
-    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }
-  ],
-  "outbounds": [
+  if proto_on reality; then
+    first_tag="vless-out"
+    ob+=("$(cat <<JSON
     {
       "type": "vless", "tag": "vless-out",
       "server": "${SERVER_IP}", "server_port": ${VLESS_PORT},
@@ -1019,18 +1408,77 @@ HTML
         "utls": { "enabled": true, "fingerprint": "chrome" },
         "reality": { "enabled": true, "public_key": "${PUB}", "short_id": "${SID}" }
       }
-    },
+    }
+JSON
+)")
+  fi
+
+  if proto_on hy2; then
+    [ -n "$first_tag" ] || first_tag="hy2-out"
+    ob+=("$(cat <<JSON
     {
       "type": "hysteria2", "tag": "hy2-out",
       "server": "${SERVER_IP}", "server_port": ${HY2_PORT},
       "password": "${HY2_PASS}",
       ${sbox_hy2_tls}
-    },
-    { "type": "direct", "tag": "direct" }
-  ],
-  "route": { "final": "vless-out" }
-}
-EOF
+    }
+JSON
+)")
+  fi
+
+  if proto_on ss2022; then
+    [ -n "$first_tag" ] || first_tag="ss2022-out"
+    ob+=("$(cat <<JSON
+    {
+      "type": "shadowsocks", "tag": "ss2022-out",
+      "server": "${SERVER_IP}", "server_port": ${SS2022_PORT},
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "$(derive_ss_key "$PRIMARY_UUID")"
+    }
+JSON
+)")
+  fi
+
+  if proto_on anytls; then
+    [ -n "$first_tag" ] || first_tag="anytls-out"
+    ob+=("$(cat <<JSON
+    {
+      "type": "anytls", "tag": "anytls-out",
+      "server": "${SERVER_IP}", "server_port": ${ANYTLS_PORT},
+      "password": "$(derive_hex "$PRIMARY_UUID")",
+      ${sbox_anytls_tls}
+    }
+JSON
+)")
+  fi
+
+  if proto_on tuic; then
+    [ -n "$first_tag" ] || first_tag="tuic-out"
+    ob+=("$(cat <<JSON
+    {
+      "type": "tuic", "tag": "tuic-out",
+      "server": "${SERVER_IP}", "server_port": ${TUIC_PORT},
+      "uuid": "${PRIMARY_UUID}", "password": "$(derive_hex "$PRIMARY_UUID")",
+      "congestion_control": "bbr",
+      ${sbox_tuic_tls}
+    }
+JSON
+)")
+  fi
+
+  [ ${#ob[@]} -gt 0 ] || die "没有任何可用协议, 检查 PROTOCOLS"
+
+  {
+    echo "{"
+    echo '  "log": { "level": "info" },'
+    echo '  "inbounds": ['
+    echo '    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }'
+    echo '  ],'
+    printf '  "outbounds": [\n%s,\n    { "type": "direct", "tag": "direct" }\n  ],\n' \
+      "$(printf '%s,\n' "${ob[@]}" | sed '$ s/,$//')"
+    printf '  "route": { "final": "%s" }\n' "$first_tag"
+    echo "}"
+  } > "$tdir/singbox.json"
 
   cat > "$tdir/client-guide.md" <<GUIDE
 # 客户端配置指南
@@ -1152,40 +1600,80 @@ EOF
 # ---------------- 输出 ----------------
 print_links(){
   echo
-  hr
-  echo -e "${M}VLESS + REALITY${N}   TCP ${VLESS_PORT}"
-  hr
-  echo "UUID      : ${UUID}"
-  echo "Flow      : xtls-rprx-vision"
-  echo "SNI       : ${DEST}"
-  echo "公钥 pbk  : ${PUB}"
-  echo "shortId   : ${SID}"
-  echo "指纹 fp   : chrome"
-  echo
-  echo -e "${G}${VLESS_LINK}${N}"
-  echo
-  hr
-  echo -e "${M}Hysteria2${N}   UDP ${HY2_PORT}"
-  hr
-  echo "密码      : ${HY2_PASS}"
-  echo "SNI       : ${DEST}"
-  if [ -n "${HY2_PIN:-}" ]; then
-    echo "证书固定  : 已启用 (pinSHA256, 无需 insecure)"
-    echo "  指纹    : ${HY2_PIN}"
-    [ -n "${CERT_HEX:-}" ] && echo "  mihomo  : fingerprint: ${CERT_HEX}"
-  else
-    echo -e "${Y}跳过证书验证: 开启 (insecure=1) —— 链路上可被冒充${N}"
-  fi
-  [ -n "${HY2_HOP:-}" ] && echo "端口跳跃  : ${HY2_HOP}"
-  [ "$ENABLE_OBFS" = "1" ] && echo "混淆      : salamander / ${OBFS_PASS}"
-  echo
-  echo -e "${G}${HY2_LINK}${N}"
-  if [ -n "${HY2_LINK_COMPAT:-}" ]; then
+  if proto_on reality; then
+    hr
+    echo -e "${M}VLESS + REALITY${N}   TCP ${VLESS_PORT}"
+    hr
+    echo "UUID      : ${UUID}"
+    echo "Flow      : xtls-rprx-vision"
+    echo "SNI       : ${DEST}"
+    echo "公钥 pbk  : ${PUB}"
+    echo "shortId   : ${SID}"
+    echo "指纹 fp   : chrome"
     echo
-    echo -e "${D}v2rayN 不识别 pinSHA256, 请改用下面这条(无身份验证):${N}"
-    echo -e "${D}${HY2_LINK_COMPAT}${N}"
+    echo -e "${G}${VLESS_LINK}${N}"
+    echo
   fi
-  echo
+
+  if proto_on hy2; then
+    hr
+    echo -e "${M}Hysteria2${N}   UDP ${HY2_PORT}"
+    hr
+    echo "密码      : ${HY2_PASS}"
+    echo "SNI       : ${DEST}"
+    if [ -n "${HY2_PIN:-}" ]; then
+      echo "证书固定  : 已启用 (pinSHA256, 无需 insecure)"
+      echo "  指纹    : ${HY2_PIN}"
+      [ -n "${CERT_HEX:-}" ] && echo "  mihomo  : fingerprint: ${CERT_HEX}"
+    else
+      echo -e "${Y}跳过证书验证: 开启 (insecure=1) —— 链路上可被冒充${N}"
+    fi
+    [ -n "${HY2_HOP:-}" ] && echo "端口跳跃  : ${HY2_HOP}"
+    [ "$ENABLE_OBFS" = "1" ] && echo "混淆      : salamander / ${OBFS_PASS}"
+    echo
+    echo -e "${G}${HY2_LINK}${N}"
+    if [ -n "${HY2_LINK_COMPAT:-}" ]; then
+      echo
+      echo -e "${D}v2rayN 不识别 pinSHA256, 请改用下面这条(无身份验证):${N}"
+      echo -e "${D}${HY2_LINK_COMPAT}${N}"
+    fi
+    echo
+  fi
+
+  if proto_on ss2022; then
+    hr
+    echo -e "${M}Shadowsocks-2022${N}   TCP+UDP ${SS2022_PORT}"
+    hr
+    echo "加密方式  : 2022-blake3-aes-128-gcm"
+    echo "设备密码  : $(derive_ss_key "$(primary_uuid)")"
+    echo -e "${D}每个设备的密码不同, 用 proxy user link <名字> 取对应链接${N}"
+    echo
+    echo -e "${G}${SS_LINK}${N}"
+    echo
+  fi
+
+  if proto_on anytls; then
+    hr
+    echo -e "${M}AnyTLS${N}   TCP ${ANYTLS_PORT}"
+    hr
+    echo "SNI       : ${DEST}"
+    echo -e "${Y}自签证书: 分享链接只能 insecure, 订阅里的 singbox.json 才是真固定${N}"
+    echo
+    echo -e "${G}${ANYTLS_LINK}${N}"
+    echo
+  fi
+
+  if proto_on tuic; then
+    hr
+    echo -e "${M}TUIC v5${N}   TCP+UDP ${TUIC_PORT}"
+    hr
+    echo "UUID      : $(primary_uuid)"
+    echo "SNI       : ${DEST}"
+    echo -e "${Y}自签证书: 分享链接只能 insecure, 订阅里的 singbox.json 才是真固定${N}"
+    echo
+    echo -e "${G}${TUIC_LINK}${N}"
+    echo
+  fi
 }
 
 print_qr(){
@@ -1285,6 +1773,9 @@ cmd_install(){
     info "全新安装"
   fi
 
+  normalize_protocols "$PROTOCOLS"
+  info "启用协议: ${PROTOCOLS}"
+
   install_deps
   preflight
 
@@ -1294,39 +1785,46 @@ cmd_install(){
     UUID=""; PRIV=""; PUB=""; SID=""; DEST=""
     HY2_PASS=""; OBFS_PASS=""; SUB_TOKEN=""; SERVER_IP=""
     HY2_PIN=""; CERT_SPKI_B64=""; CERT_DER_B64=""; CERT_HEX=""
+    SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""; SB_HEX=""
     fresh=1
   fi
 
-  # 端口占用: 清理后仍被占 = 外部进程; 已安装状态被占 = 可能是别人抢了端口
-  local owner=""
-  owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
-  if [ -n "$owner" ]; then
-    if [ "$fresh" = "0" ] && echo "$owner" | grep -qE '^(xray|hysteria)'; then
-      info "TCP ${VLESS_PORT} 由本服务自身监听, 继续"
-    else
-      warn "TCP ${VLESS_PORT} 已被占用: ${owner}"
-      ss -tlnp 2>/dev/null | awk -v p=":${VLESS_PORT}" '$4 ~ (p "$")'
-      echo
-      if echo "$owner" | grep -qE '^(xray|hysteria)'; then
-        if ask_yes "这是本脚本残留的实例, 清理后继续?"; then
-          do_clean 0
-          sleep 1
-        fi
-      else
-        if ask_yes "结束该进程(${owner})并继续?"; then
-          kill_port_owner "$VLESS_PORT" tcp
-          sleep 1
-        fi
+  # 端口占用: 逐个检查已启用协议的端口
+  local plist="" p port proto2 owner=""
+  proto_on reality && plist="${plist} ${VLESS_PORT}/tcp"
+  proto_on hy2     && plist="${plist} ${HY2_PORT}/udp"
+  proto_on ss2022  && plist="${plist} ${SS2022_PORT}/tcp ${SS2022_PORT}/udp"
+  proto_on anytls  && plist="${plist} ${ANYTLS_PORT}/tcp"
+  proto_on tuic    && plist="${plist} ${TUIC_PORT}/tcp ${TUIC_PORT}/udp"
+
+  for p in $plist; do
+    port="${p%%/*}"; proto2="${p##*/}"
+    owner=$(port_owner "$port" "$proto2") || owner=""
+    [ -n "$owner" ] || continue
+    if [ "$fresh" = "0" ] && echo "$owner" | grep -qE '^(xray|hysteria|sing-box)'; then
+      info "$(echo "$proto2" | tr a-z A-Z) ${port} 由本服务自身监听, 继续"
+      continue
+    fi
+    warn "$(echo "$proto2" | tr a-z A-Z) ${port} 已被占用: ${owner}"
+    if echo "$owner" | grep -qE '^(xray|hysteria|sing-box)'; then
+      if ask_yes "这是本脚本残留的实例, 清理后继续?"; then
+        do_clean 0; sleep 1
       fi
-      if port_in_use "$VLESS_PORT" tcp; then
-        die "端口仍被占用。重装试试: bash $(basename "$0") install --clean; 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
+    else
+      if ask_yes "结束该进程(${owner})并继续?"; then
+        kill_port_owner "$port" "$proto2"; sleep 1
       fi
     fi
-  fi
+    if port_in_use "$port" "$proto2"; then
+      die "端口 ${port}/${proto2} 仍被占用。重装试试: bash $(basename "$0") install --clean; 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
+    fi
+  done
 
-  ensure_xray
-  ensure_xray_service
   ensure_creds
+  if proto_on reality; then
+    ensure_xray
+    ensure_xray_service
+  fi
 
   SERVER_IP=$(get_server_ip)
   [ -n "$SERVER_IP" ] || die "无法获取公网 IP"
@@ -1334,26 +1832,42 @@ cmd_install(){
 
   backup_config
 
-  if [ -z "${DEST:-}" ]; then
-    pick_dest || die "所有目标站握手失败。可手动指定: REALITY_DEST=www.samsung.com bash setup-proxy.sh"
-  else
-    info "复用伪装目标: ${DEST}"
-  fi
-
-  write_xray_config "$DEST"
-  systemctl restart xray >/dev/null 2>&1
-  sleep 2
-  if ! systemctl is-active --quiet xray; then
-    owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
-    if [ -n "$owner" ]; then
-      die "Xray 启动失败: TCP ${VLESS_PORT} 被 ${owner} 占用。执行 bash $(basename "$0") install --clean 清理后重装, 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
+  # REALITY / AnyTLS / TUIC 都需要一个 SNI 伪装目标
+  if proto_on reality || proto_on anytls || proto_on tuic; then
+    if [ -z "${DEST:-}" ]; then
+      pick_dest || die "所有目标站握手失败。可手动指定: REALITY_DEST=www.samsung.com bash setup-proxy.sh"
+    else
+      info "复用伪装目标: ${DEST}"
     fi
-    die "Xray 启动失败, 查看: journalctl -u xray -n 30 --no-pager"
   fi
-  ok "Xray 运行中: TCP ${VLESS_PORT}, 伪装目标 ${DEST}"
 
-  ensure_hy2
-  setup_hy2_hop
+  if proto_on reality; then
+    write_xray_config "$DEST"
+    systemctl restart xray >/dev/null 2>&1
+    sleep 2
+    if ! systemctl is-active --quiet xray; then
+      owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
+      if [ -n "$owner" ]; then
+        die "Xray 启动失败: TCP ${VLESS_PORT} 被 ${owner} 占用。执行 bash $(basename "$0") install --clean 清理后重装, 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
+      fi
+      die "Xray 启动失败, 查看: journalctl -u xray -n 30 --no-pager"
+    fi
+    ok "Xray 运行中: TCP ${VLESS_PORT}, 伪装目标 ${DEST}"
+  fi
+
+  if proto_on hy2; then
+    ensure_hy2
+    setup_hy2_hop
+  fi
+
+  if sb_enabled; then
+    ensure_singbox
+    ensure_sb_cert
+    ensure_sb_creds
+    write_singbox_config
+    ensure_singbox_service
+  fi
+
   optimize_system
   setup_firewall
   install_healthcheck
@@ -1461,16 +1975,29 @@ cmd_status(){
   hr
   echo -e "${M}服务状态${N}"
   hr
-  printf 'xray            : %s / %s\n' "$(systemctl is-active xray 2>/dev/null)" "$(systemctl is-enabled xray 2>/dev/null)"
-  printf 'hysteria-server : %s / %s\n' "$(systemctl is-active hysteria-server 2>/dev/null)" "$(systemctl is-enabled hysteria-server 2>/dev/null)"
+  echo -e "${D}启用协议: ${PROTOCOLS:-reality,hy2}${N}"
+  proto_on reality && printf 'xray            : %s / %s\n' "$(systemctl is-active xray 2>/dev/null)" "$(systemctl is-enabled xray 2>/dev/null)"
+  proto_on hy2     && printf 'hysteria-server : %s / %s\n' "$(systemctl is-active hysteria-server 2>/dev/null)" "$(systemctl is-enabled hysteria-server 2>/dev/null)"
+  sb_enabled       && printf 'sing-box        : %s / %s\n' "$(systemctl is-active sing-box 2>/dev/null)" "$(systemctl is-enabled sing-box 2>/dev/null)"
   [ -n "${HY2_HOP:-}" ] && printf 'hy2-hop         : %s\n' "$(systemctl is-active hy2-hop 2>/dev/null)"
   [ "$SUB_HTTP" = "1" ] && printf 'proxy-sub       : %s\n' "$(systemctl is-active proxy-sub 2>/dev/null)"
   echo
   echo -e "${M}监听端口${N}"
-  ss -tulnp 2>/dev/null | grep -E ":(443|8443|54321|${VLESS_PORT}|${HY2_PORT})[[:space:]]" || echo "(未找到匹配端口)"
+  local plist="" p
+  proto_on reality && plist="${plist}|${VLESS_PORT}"
+  proto_on hy2     && plist="${plist}|${HY2_PORT}"
+  proto_on ss2022  && plist="${plist}|${SS2022_PORT}"
+  proto_on anytls  && plist="${plist}|${ANYTLS_PORT}"
+  proto_on tuic    && plist="${plist}|${TUIC_PORT}"
+  if [ -n "$plist" ]; then
+    ss -tulnp 2>/dev/null | grep -E "(${plist#|})[[:space:]]" || echo "(未找到匹配端口)"
+  else
+    echo "(无)"
+  fi
   echo
   echo -e "${M}出口 IPv4${N} : ${SERVER_IP:-未知}"
-  echo -e "${M}Xray 版本${N} : $($XRAY_BIN version 2>/dev/null | head -1)"
+  [ -x "$XRAY_BIN" ] && echo -e "${M}Xray 版本${N} : $($XRAY_BIN version 2>/dev/null | head -1)"
+  [ -x "$SB_BIN" ]   && echo -e "${M}sing-box${N}  : $($SB_BIN version 2>/dev/null | head -1)"
   echo -e "${M}拥塞控制${N}  : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   echo -e "${M}设备凭据${N}  : $(wc -l < "$USERS_FILE" 2>/dev/null || echo 0) 条 (proxy user list)"
   echo -e "${M}脚本版本${N}  : ${SCRIPT_VERSION}"
@@ -1770,6 +2297,7 @@ cmd_reset(){
   warn "重置会生成新的 UUID / 密钥 / hy2 密码, 所有客户端必须重新导入!"
   ask_yes "确认重置凭据?" || { info "已取消"; return 0; }
   UUID=""; PRIV=""; PUB=""; SID=""; HY2_PASS=""; OBFS_PASS=""; DEST=""
+  SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""; SB_HEX=""
   rm -f "$USERS_FILE"
   save_state
   info "重新生成凭据..."
@@ -1855,6 +2383,9 @@ residue_report(){
   [ -f /etc/systemd/system/hy2-hop.service ]         && { out+="    - systemd: hy2-hop.service"$'\n'; found=1; }
   [ -f /etc/systemd/system/proxy-sub.service ]       && { out+="    - systemd: proxy-sub.service"$'\n'; found=1; }
   [ -f /etc/systemd/system/proxy-healthcheck.timer ] && { out+="    - systemd: proxy-healthcheck.timer"$'\n'; found=1; }
+  [ -f /etc/systemd/system/sing-box.service ]        && { out+="    - systemd: sing-box.service"$'\n'; found=1; }
+  [ -x "$SB_BIN" ]                                   && { out+="    - 二进制: $SB_BIN"$'\n'; found=1; }
+  [ -d /etc/sing-box ]                               && { out+="    - 配置: /etc/sing-box"$'\n'; found=1; }
   [ -x "$XRAY_BIN" ]                                 && { out+="    - 二进制: $XRAY_BIN"$'\n'; found=1; }
   [ -x "$HY2_BIN" ]                                  && { out+="    - 二进制: $HY2_BIN"$'\n'; found=1; }
   [ -d /usr/local/etc/xray ]                         && { out+="    - 配置: /usr/local/etc/xray"$'\n'; found=1; }
@@ -1919,9 +2450,10 @@ do_clean(){
     [ -n "$hport" ] || hport=$(sed -n "s/^HY2_PORT='\(.*\)'\$/\1/p" "$STATE_FILE" 2>/dev/null | head -1)
   fi
 
-  systemctl disable --now xray hysteria-server hy2-hop proxy-sub proxy-healthcheck.timer >/dev/null 2>&1 || true
+  systemctl disable --now xray hysteria-server sing-box hy2-hop proxy-sub proxy-healthcheck.timer >/dev/null 2>&1 || true
 
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/hysteria-server.service \
+        /etc/systemd/system/sing-box.service \
         /etc/systemd/system/hy2-hop.service /etc/systemd/system/proxy-sub.service \
         /etc/systemd/system/proxy-healthcheck.service /etc/systemd/system/proxy-healthcheck.timer
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1930,6 +2462,7 @@ do_clean(){
   # 只杀本脚本自己的二进制, 不碰系统里其它程序
   pkill -f '^/usr/local/bin/xray' >/dev/null 2>&1 || true
   pkill -f '^/usr/local/bin/hysteria' >/dev/null 2>&1 || true
+  pkill -f '^/usr/local/bin/sing-box' >/dev/null 2>&1 || true
   sleep 1
 
   # 端口跳跃的 NAT 规则(可能残留多条)
@@ -1939,8 +2472,8 @@ do_clean(){
     done
   fi
 
-  rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/hysteria "$SUB_DIR" "$STATE_DIR"
-  rm -f "$XRAY_BIN" "${XRAY_BIN}.prev" "$HY2_BIN" /root/proxy-info.txt \
+  rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/hysteria /etc/sing-box "$SUB_DIR" "$STATE_DIR"
+  rm -f "$XRAY_BIN" "${XRAY_BIN}.prev" "$HY2_BIN" "$SB_BIN" /root/proxy-info.txt \
         /usr/local/bin/proxy-healthcheck.sh \
         /etc/sysctl.d/99-proxy-optimize.conf \
         /etc/systemd/journald.conf.d/99-proxy-size.conf
@@ -2076,7 +2609,11 @@ Proxy Node Installer v3
   upgrade [版本]   升级 Xray 内核; upgrade --rollback 回滚上一版
 
 首次安装可用的环境变量:
-  VLESS_PORT=443  HY2_PORT=443
+  PROTOCOLS=reality,hy2           协议组合, 逗号分隔
+                                  可选: reality hy2 ss2022 anytls tuic
+  VLESS_PORT=443  HY2_PORT=443    主协议端口
+  SS2022_PORT=8445  ANYTLS_PORT=8444  TUIC_PORT=8443
+                                  扩展协议端口(sing-box 承载)
   REALITY_DEST=www.bing.com      指定伪装站(留空=自动挑选)
   ENABLE_OBFS=1                  开启 hy2 salamander 混淆
   HY2_HOP=20000-30000            hy2 UDP 端口跳跃
@@ -2089,6 +2626,9 @@ Proxy Node Installer v3
 示例:
   bash setup-proxy.sh
   bash setup-proxy.sh install --clean         端口被占用时一条命令重来
+  PROTOCOLS=reality,hy2,ss2022 bash setup-proxy.sh install
+                                              加装 Shadowsocks-2022
+  PROTOCOLS=reality,hy2,anytls,tuic bash setup-proxy.sh install
   bash setup-proxy.sh clean --all             连管理命令一起删干净
   VLESS_PORT=8443 HY2_PORT=8443 bash setup-proxy.sh install
   ENABLE_OBFS=1 HY2_HOP=20000-30000 bash setup-proxy.sh install

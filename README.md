@@ -12,7 +12,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 双协议 | VLESS + REALITY（TCP 443）+ Hysteria2（UDP 443），互不冲突 |
+| 多协议 | 5 种可自由组合：VLESS-REALITY、Hysteria2、Shadowsocks-2022、AnyTLS、TUIC v5；默认前两种，其余按需加装 |
 | 证书固定 | Hysteria2 自签证书用 `pinSHA256` 固定指纹，客户端**不需要 `insecure`** |
 | 自动选伪装站 | 遍历候选站点，**用真实 REALITY 握手验证**通过才采用 |
 | 幂等安装 | 凭据持久化，重跑脚本不会重置 UUID，已有客户端不失效 |
@@ -166,13 +166,47 @@ proxy audit --dnsbl    # 额外查反垃圾库（会把 IP 提交给 Spamhaus）
 
 ---
 
+## 协议选择
+
+默认只装两种（`reality,hy2`），其余按需加。`PROTOCOLS` 用逗号分隔：
+
+```bash
+PROTOCOLS=reality,hy2,ss2022 bash setup-proxy.sh install
+PROTOCOLS=reality,hy2,anytls,tuic bash setup-proxy.sh install
+PROTOCOLS=ss2022 bash setup-proxy.sh install        # 只装一个也可以
+```
+
+| 协议 | 内核 | 端口默认 | 适合什么 |
+|---|---|---|---|
+| `reality` | Xray | TCP 443 | 主力。借用真实站点证书，抗封锁最强，不需要你有域名 |
+| `hy2` | hysteria | UDP 443 | 备用。UDP 抗丢包，弱网、跨境视频更稳 |
+| `ss2022` | sing-box | TCP+UDP 8445 | 兼容兜底。老客户端、路由器、IoT 设备基本都认 |
+| `anytls` | sing-box | TCP 8444 | 新协议。TLS 内多路复用，流量特征接近普通 HTTPS |
+| `tuic` | sing-box | TCP+UDP 8443 | UDP 系，BBR 拥塞控制，晚高峰表现好 |
+
+后三个由同一个 sing-box 进程承载，装几个都只占一个进程。
+
+**端口别撞**：扩展协议默认从 8443 起，避免和 REALITY 抢 443。要改就一起改：
+
+```bash
+SS2022_PORT=9445 ANYTLS_PORT=9444 TUIC_PORT=9443 bash setup-proxy.sh install
+```
+
+**证书固定在这三个协议上有区别**：它们的分享链接（`ss://`、`anytls://`、`tuic://`）标准里没有证书指纹字段，
+只能 `insecure=1`；订阅里的 `singbox.json` 才是真正固定的。所以用这三个协议时优先导入 sing-box 订阅，
+不要用单条链接。这一点 `client-guide.md` 里也写了。
+
 ## 环境变量
 
 首次安装时通过环境变量定制，安装后写入 `/etc/proxy-node/state.env` 复用：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `PROTOCOLS` | `reality,hy2` | 协议组合，可选 `reality` `hy2` `ss2022` `anytls` `tuic` |
 | `VLESS_PORT` | `443` | VLESS 监听 TCP 端口 |
+| `SS2022_PORT` | `8445` | Shadowsocks-2022 端口（TCP+UDP） |
+| `ANYTLS_PORT` | `8444` | AnyTLS 端口（TCP） |
+| `TUIC_PORT` | `8443` | TUIC v5 端口（TCP+UDP） |
 | `HY2_PORT` | `443` | Hysteria2 监听 UDP 端口（可与 TCP 443 共存） |
 | `REALITY_DEST` | 自动 | 伪装目标站，留空则自动挑选并验证 |
 | `ENABLE_OBFS` | `0` | `1` 开启 Hysteria2 salamander 混淆 |
