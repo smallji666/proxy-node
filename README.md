@@ -13,6 +13,7 @@
 | 能力 | 说明 |
 |---|---|
 | 双协议 | VLESS + REALITY（TCP 443）+ Hysteria2（UDP 443），互不冲突 |
+| 证书固定 | Hysteria2 自签证书用 `pinSHA256` 固定指纹，客户端**不需要 `insecure`** |
 | 自动选伪装站 | 遍历候选站点，**用真实 REALITY 握手验证**通过才采用 |
 | 幂等安装 | 凭据持久化，重跑脚本不会重置 UUID，已有客户端不失效 |
 | 订阅生成 | 自动产出 `clash.yaml` / `singbox.json` / `base64` 通用订阅 / 原始链接 |
@@ -100,6 +101,7 @@ proxy audit --dnsbl    # 额外查反垃圾库（会把 IP 提交给 Spamhaus）
 | `REALITY_DEST` | 自动 | 伪装目标站，留空则自动挑选并验证 |
 | `ENABLE_OBFS` | `0` | `1` 开启 Hysteria2 salamander 混淆 |
 | `HY2_HOP` | 空 | 端口跳跃区间，如 `20000-30000` |
+| `HY2_INSECURE` | `0` | `1` 关闭证书固定、退回 `insecure`，**仅调试用** |
 | `SUB_HTTP` | `0` | `1` 起一个订阅 HTTP 服务 |
 | `SUB_PORT` | 随机 | 订阅 HTTP 端口 |
 | `NODE_NAME` | `Node` | 节点名（订阅与链接里的显示名） |
@@ -128,6 +130,7 @@ links.txt      原始链接（两行）
 base64.txt     通用订阅，小火箭 / v2rayN / v2rayNG 直接导入
 clash.yaml     Clash / mihomo / Clash Verge
 singbox.json   sing-box
+client-guide.md 客户端配置指南（证书固定 / TUN 参数 / 排障）
 ```
 
 加 `SUB_HTTP=1` 会起一个静态 HTTP 服务提供订阅链接。目录里放了 `index.html`
@@ -166,6 +169,28 @@ Xray 从 **v26.9.8** 起，要求 REALITY 握手的 ClientHello 中首个 `key_s
 
 需要升级时脚本提供了 `proxy upgrade`，但会先打印警告并要求确认。
 
+### 为什么用自签证书 + 指纹固定，而不是申请证书
+
+Hysteria2 基于 QUIC，必须走完整 TLS 握手，所以需要一张证书；而裸 IP 签不出公共 CA 证书。
+
+常见做法是勾"跳过证书验证"，但那等于**完全不验证对端身份** —— 链路上任何人都能冒充服务器，
+拿走你的密码和全部明文域名。这是这个脚本早期版本的问题，现在已经改掉。
+
+正确做法是**指纹固定**：客户端不验证 CA 链，只验证"这张证书的公钥哈希必须等于我记下的值"。
+指纹只能来自你这台服务器，中间人换不掉，安全性等同于正式证书，且不需要域名、不需要续期。
+
+脚本在部署时会用**真实握手自测**指纹形式（SPKI / 整证书），确认能通才写进链接，
+所以不会出现"配了指纹反而连不上"的情况。确实要退回时用 `HY2_INSECURE=1`。
+
+| 客户端 | 字段 |
+|---|---|
+| hysteria2 链接 | `pinSHA256`（脚本自动带上） |
+| sing-box | `tls.certificate_public_key_sha256` |
+| mihomo / Clash | `skip-cert-verify: false` + `fingerprint` |
+
+> 注意：v2rayN 的 Hysteria2 界面只有"跳过证书验证"一个勾选框，没有指纹字段。
+> 想用固定指纹又要图形化配置，选 Clash Verge Rev（mihomo 支持 `fingerprint`）。
+
 ### 伪装目标站黑名单
 
 | 域名 | 原因 |
@@ -203,6 +228,9 @@ Xray 新版支持给 VLESS 头部加密（`"decryption": "mlkem768x25519plus.nat
 - 不向任何第三方上报信息；公网 IP 优先从本地路由表读取，读不到才查询公共 IP 回显服务
 - 反垃圾库查询（`proxy audit --dnsbl`）**默认关闭**，因为它会把 IP 交给第三方 DNSBL，需要你显式开启
 - 敏感文件权限：`/etc/proxy-node/state.env` 600、`/root/proxy-info.txt` 600、Hysteria2 私钥 600
+- Hysteria2 使用自签证书 + 指纹固定，**不依赖 `insecure`**；订阅里带的是公钥指纹，不是私钥
+- systemd 单元启用沙箱：`NoNewPrivileges`、`PrivateTmp`、`ProtectHome`、`ProtectKernelTunables`、
+  `RestrictAddressFamilies` 等，服务被攻破后能动手的范围被压到最小
 - 部署日志：`/var/log/proxy-deploy.log`
 
 ---
@@ -251,6 +279,20 @@ Xray 新版支持给 VLESS 头部加密（`"decryption": "mlkem768x25519plus.nat
 
 先确认服务端 Xray 版本是不是被升到了 26.9.8 以上。是的话执行
 `XRAY_VERSION=26.3.27 bash /root/setup-proxy.sh install` 回滚。
+
+**Q: 开了 TUN 模式就完全没网**
+
+按这四项核对，顺序就是出错概率：
+
+1. **MTU 填 1500** —— sing-box 默认 9000，家宽/Wi-Fi 实际只有 1500 或 1492，大包会被丢弃
+2. **关掉"严格路由"** —— 开着时出站一断就全黑洞，DNS 也被一起劫持进 TUN
+3. **管理员权限运行** —— 建不了虚拟网卡时会静默失败，而系统代理此时已被关掉
+4. **DNS 别只押一个 DoH** —— 所有域名走同一个远程 DoH，节点一抖就全部超时
+
+定位方法：TUN 开着时 `ping 1.1.1.1`，通说明路由没问题、问题在 DNS；不通说明网卡或路由没起来。
+
+Windows 上 v2rayN 的 TUN 由 sing-box 内核实现，还需要 `bin\sing_box\wintun.dll`。
+缺了就把它从 `bin\xray\wintun.dll` 复制过去，否则虚拟网卡根本创建不出来。
 
 **Q: 换端口后连不上**
 

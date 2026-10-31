@@ -20,6 +20,7 @@
 #     VLESS_PORT=443  HY2_PORT=443  REALITY_DEST=www.bing.com
 #     ENABLE_OBFS=1   开启 hy2 salamander 混淆
 #     HY2_HOP=20000-30000   hy2 UDP 端口跳跃
+#     HY2_INSECURE=1  关闭证书固定, 退回 insecure (不推荐, 仅临时调试)
 #     SUB_HTTP=1      起一个订阅 HTTP 服务(默认关)
 #     ASSUME_YES=1    全程不询问
 # ============================================================
@@ -42,6 +43,7 @@ _RAW_XRAY_VERSION="${XRAY_VERSION-__unset__}"
 _RAW_REALITY_DEST="${REALITY_DEST-__unset__}"
 _RAW_ENABLE_OBFS="${ENABLE_OBFS-__unset__}"
 _RAW_HY2_HOP="${HY2_HOP-__unset__}"
+_RAW_HY2_INSECURE="${HY2_INSECURE-__unset__}"
 _RAW_SUB_HTTP="${SUB_HTTP-__unset__}"
 _RAW_SUB_PORT="${SUB_PORT-__unset__}"
 _RAW_NODE_NAME="${NODE_NAME-__unset__}"
@@ -53,6 +55,7 @@ XRAY_VERSION="${XRAY_VERSION:-26.3.27}"
 REALITY_DEST="${REALITY_DEST:-}"
 ENABLE_OBFS="${ENABLE_OBFS:-0}"
 HY2_HOP="${HY2_HOP:-}"
+HY2_INSECURE="${HY2_INSECURE:-0}"
 SUB_HTTP="${SUB_HTTP:-0}"
 SUB_PORT="${SUB_PORT:-}"
 NODE_NAME="${NODE_NAME:-Node}"
@@ -80,6 +83,11 @@ die(){  err "$*"; echo; err "部署中止。完整日志: ${LOG_FILE}"; exit 1; 
 hr(){ echo -e "${D}------------------------------------------------------------${N}"; }
 
 need_root(){ [ "$(id -u)" -eq 0 ] || die "请用 root 运行"; }
+
+# version_ge A B  ->  A >= B (按版本号而非字符串比较)
+version_ge(){
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V 2>/dev/null | head -1)" = "$2" ]
+}
 
 ask_yes(){
   [ "$ASSUME_YES" = "1" ] && return 0
@@ -117,6 +125,11 @@ save_state(){
     echo "ENABLE_OBFS='${ENABLE_OBFS}'"
     echo "OBFS_PASS='${OBFS_PASS:-}'"
     echo "HY2_HOP='${HY2_HOP:-}'"
+    echo "HY2_PIN='${HY2_PIN:-}'"
+    echo "HY2_INSECURE='${HY2_INSECURE}'"
+    echo "CERT_SPKI_B64='${CERT_SPKI_B64:-}'"
+    echo "CERT_DER_B64='${CERT_DER_B64:-}'"
+    echo "CERT_HEX='${CERT_HEX:-}'"
     echo "SUB_TOKEN='${SUB_TOKEN:-}'"
     echo "SUB_PORT='${SUB_PORT:-}'"
     echo "SUB_HTTP='${SUB_HTTP}'"
@@ -131,6 +144,7 @@ apply_env_overrides(){
   [ "$_RAW_XRAY_VERSION" != "__unset__" ] && XRAY_VERSION="$_RAW_XRAY_VERSION"
   [ "$_RAW_ENABLE_OBFS"  != "__unset__" ] && ENABLE_OBFS="$_RAW_ENABLE_OBFS"
   [ "$_RAW_HY2_HOP"      != "__unset__" ] && HY2_HOP="$_RAW_HY2_HOP"
+  [ "$_RAW_HY2_INSECURE" != "__unset__" ] && HY2_INSECURE="$_RAW_HY2_INSECURE"
   [ "$_RAW_SUB_HTTP"     != "__unset__" ] && SUB_HTTP="$_RAW_SUB_HTTP"
   [ "$_RAW_SUB_PORT"     != "__unset__" ] && SUB_PORT="$_RAW_SUB_PORT"
   if [ "$_RAW_NODE_NAME" != "__unset__" ]; then
@@ -210,6 +224,10 @@ download_with_mirror(){
 
 ensure_xray(){
   local arch asset
+  if version_ge "$XRAY_VERSION" "26.9.8"; then
+    warn "Xray ${XRAY_VERSION} >= 26.9.8: REALITY 强制要求 X25519MLKEM768"
+    warn "  小火箭/Stash 发不出该字段, 会「开关变绿但打不开网页」"
+  fi
   arch=$(uname -m)
   case "$arch" in
     x86_64|amd64)  asset="Xray-linux-64.zip" ;;
@@ -393,7 +411,7 @@ pick_dest(){
 }
 
 ensure_xray_service(){
-  if [ ! -f /etc/systemd/system/xray.service ]; then
+  if [ ! -f /etc/systemd/system/xray.service ] || ! grep -q 'PrivateTmp=true' /etc/systemd/system/xray.service; then
     cat > /etc/systemd/system/xray.service <<'UNIT'
 [Unit]
 Description=Xray Service
@@ -402,6 +420,16 @@ After=network.target nss-lookup.target
 [Service]
 User=root
 NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=on-failure
 RestartSec=3
@@ -486,7 +514,7 @@ ensure_hy2(){
   } > "$HY2_CFG"
   chmod 600 "$HY2_CFG"
 
-  if [ ! -f /etc/systemd/system/hysteria-server.service ]; then
+  if [ ! -f /etc/systemd/system/hysteria-server.service ] || ! grep -q 'NoNewPrivileges=true' /etc/systemd/system/hysteria-server.service; then
     cat > /etc/systemd/system/hysteria-server.service <<'UNIT'
 [Unit]
 Description=Hysteria2 Server
@@ -495,6 +523,17 @@ After=network.target
 [Service]
 Type=simple
 User=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=on-failure
 RestartSec=3
@@ -510,16 +549,71 @@ UNIT
   sleep 2
   systemctl is-active --quiet hysteria-server || die "Hysteria2 未能启动, 查看: journalctl -u hysteria-server -n 30"
   ok "Hysteria2 运行中, 监听 UDP ${HY2_PORT}"
+
+  # 自签证书必须靠指纹固定来验证身份, 否则 insecure 等于对中间人完全敞开
+  compute_cert_pins || warn "证书指纹计算失败"
+  if [ "$HY2_INSECURE" = "1" ]; then
+    HY2_PIN=""
+    warn "HY2_INSECURE=1: 客户端将跳过证书验证, 链路上可被冒充(仅建议临时调试)"
+  elif resolve_hy2_pin; then
+    if [ "${HY2_PIN_UNVERIFIED:-0}" = "1" ]; then
+      warn "证书固定已写入配置, 但本机自测不通(常见于 UDP 回环受限), 以客户端实测为准"
+    else
+      ok "证书固定已生效: ${HY2_PIN:0:24}..."
+    fi
+  else
+    HY2_PIN=""
+    warn "证书固定自测失败, 回退 insecure; 建议检查 hysteria 版本是否支持 pinSHA256"
+  fi
+}
+
+# 自签证书的三种指纹表示, 对应不同客户端字段:
+#   SPKI 公钥 SHA-256 (base64) -> hysteria2 URI pinSHA256 / sing-box certificate_public_key_sha256
+#   整证书 SHA-256   (base64) -> 部分实现按整证书校验, 作为兜底
+#   证书指纹         (hex)    -> mihomo / Clash 系 fingerprint
+compute_cert_pins(){
+  local cert=/etc/hysteria/cert.pem
+  [ -f "$cert" ] || return 1
+  CERT_SPKI_B64=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform der 2>/dev/null \
+    | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)
+  CERT_DER_B64=$(openssl x509 -in "$cert" -outform der 2>/dev/null \
+    | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)
+  CERT_HEX=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
+  [ -n "$CERT_SPKI_B64" ] && [ -n "$CERT_DER_B64" ] && [ -n "$CERT_HEX" ]
+}
+
+# 用真实握手逐个验证指纹形式, 不靠猜算法
+# 两种都不通时再测 insecure: 若 insecure 也不通, 说明是本机 UDP 回环问题而非指纹问题
+resolve_hy2_pin(){
+  local v
+  HY2_PIN_UNVERIFIED=0
+  for v in "${CERT_SPKI_B64:-}" "${CERT_DER_B64:-}"; do
+    [ -n "$v" ] || continue
+    if verify_hy2 "$v"; then HY2_PIN="$v"; return 0; fi
+  done
+  if ! verify_hy2 ""; then
+    HY2_PIN="${CERT_SPKI_B64:-}"
+    HY2_PIN_UNVERIFIED=1
+    [ -n "$HY2_PIN" ]
+    return $?
+  fi
+  return 1
 }
 
 verify_hy2(){
-  local code
+  local pin="${1:-}" code
   {
     echo "server: 127.0.0.1:${HY2_PORT}"
     echo "auth: ${HY2_PASS}"
     echo "tls:"
     echo "  sni: ${DEST}"
-    echo "  insecure: true"
+    if [ -n "$pin" ]; then
+      echo "  pinSHA256: ${pin}"
+    else
+      echo "  insecure: true"
+    fi
     if [ "$ENABLE_OBFS" = "1" ]; then
       echo "obfs:"
       echo "  type: salamander"
@@ -532,10 +626,11 @@ verify_hy2(){
   $HY2_BIN client -c /tmp/_hc.yaml >/tmp/_hc.log 2>&1 &
   local pid=$!
   sleep 4
-  code=$(curl -s --socks5-hostname 127.0.0.1:10898 -o /dev/null -w '%{http_code}' --max-time 20 https://www.youtube.com 2>/dev/null)
+  code=$(curl -s --socks5-hostname 127.0.0.1:10898 -o /dev/null -w '%{http_code}' --max-time 15 https://www.gstatic.com/generate_204 2>/dev/null)
+  case "$code" in 000|"") code=$(curl -s --socks5-hostname 127.0.0.1:10898 -o /dev/null -w '%{http_code}' --max-time 20 https://www.youtube.com 2>/dev/null) ;; esac
   kill $pid >/dev/null 2>&1; wait $pid 2>/dev/null
   rm -f /tmp/_hc.yaml /tmp/_hc.log
-  case "$code" in 200|301|302) return 0 ;; *) return 1 ;; esac
+  case "$code" in 2*|3*) return 0 ;; *) return 1 ;; esac
 }
 
 # ---------------- 端口跳跃 ----------------
@@ -699,7 +794,13 @@ setup_firewall(){
 # ---------------- 链接生成 ----------------
 gen_links(){
   VLESS_LINK="vless://${UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${NODE_NAME}-VLESS"
-  HY2_LINK="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}&insecure=1"
+  HY2_LINK="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${DEST}"
+  if [ -n "${HY2_PIN:-}" ]; then
+    # base64 里的 + 在 query 中会被解析成空格, 必须转义; / 和 = 在 query 值里合法
+    HY2_LINK="${HY2_LINK}&pinSHA256=${HY2_PIN//+/%2B}"
+  else
+    HY2_LINK="${HY2_LINK}&insecure=1"
+  fi
   if [ -n "${HY2_HOP:-}" ]; then
     HY2_LINK="${HY2_LINK}&mport=${HY2_HOP}"
   fi
@@ -754,7 +855,12 @@ HTML
     echo "    port: ${HY2_PORT}"
     echo "    password: \"${HY2_PASS}\""
     echo "    sni: ${DEST}"
-    echo "    skip-cert-verify: true"
+    if [ -n "${HY2_PIN:-}" ] && [ -n "${CERT_HEX:-}" ]; then
+      echo "    skip-cert-verify: false"
+      echo "    fingerprint: ${CERT_HEX}"
+    else
+      echo "    skip-cert-verify: true"
+    fi
     [ -n "${HY2_HOP:-}" ] && echo "    ports: \"${HY2_HOP}\""
     if [ "$ENABLE_OBFS" = "1" ]; then
       echo "    obfs: salamander"
@@ -769,6 +875,13 @@ HTML
     echo "rules:"
     echo "  - MATCH,PROXY"
   } > "$tdir/clash.yaml"
+
+  local sbox_hy2_tls
+  if [ -n "${HY2_PIN:-}" ] && [ -n "${CERT_SPKI_B64:-}" ]; then
+    sbox_hy2_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"certificate_public_key_sha256\": [\"${CERT_SPKI_B64}\"] }"
+  else
+    sbox_hy2_tls="\"tls\": { \"enabled\": true, \"server_name\": \"${DEST}\", \"insecure\": true }"
+  fi
 
   cat > "$tdir/singbox.json" <<EOF
 {
@@ -791,13 +904,77 @@ HTML
       "type": "hysteria2", "tag": "hy2-out",
       "server": "${SERVER_IP}", "server_port": ${HY2_PORT},
       "password": "${HY2_PASS}",
-      "tls": { "enabled": true, "server_name": "${DEST}", "insecure": true }
+      ${sbox_hy2_tls}
     },
     { "type": "direct", "tag": "direct" }
   ],
   "route": { "final": "vless-out" }
 }
 EOF
+
+  cat > "$tdir/client-guide.md" <<GUIDE
+# 客户端配置指南
+
+节点: ${SERVER_IP}   VLESS/TCP ${VLESS_PORT}   Hysteria2/UDP ${HY2_PORT}
+伪装域名: ${DEST}
+
+## 一、Hysteria2 是自签证书, 靠指纹固定验证身份
+
+服务端没有公共 CA 证书。客户端不要勾"跳过证书验证", 改用指纹固定 ——
+指纹只能来自这台服务器, 链路上换不了, 安全性等同于正式证书。
+
+| 客户端 | 怎么填 |
+|---|---|
+| v2rayN / 小火箭 / v2rayNG | 直接用带 pinSHA256 的链接, 无需额外设置 |
+| sing-box | tls.certificate_public_key_sha256 填 SPKI 那行 |
+| mihomo / Clash Verge | skip-cert-verify: false, fingerprint 填 hex 那行 |
+
+指纹 pinSHA256 (hysteria2 链接里已带):
+${HY2_PIN:-未启用, 当前为 insecure}
+
+指纹 SPKI (sing-box certificate_public_key_sha256):
+${CERT_SPKI_B64:-未计算}
+
+指纹 hex (mihomo fingerprint):
+${CERT_HEX:-未计算}
+
+## 二、TUN 模式必看的四个设置
+
+TUN 出问题基本都在这四项里, 按顺序核对:
+
+1. MTU 填 1500
+   sing-box 默认 9000, 而家宽/Wi-Fi 实际 MTU 只有 1500 或 1492。
+   9000 会让大包被丢弃, 典型症状是"显示已连接, 但网页打不开"。
+
+2. 关闭"严格路由"(strict_route)
+   开着时出站一旦不通, 全部流量被黑洞, DNS 也一起被劫持进 TUN,
+   表现为整台机器断网, 而不只是代理不通。
+
+3. 用管理员权限运行
+   TUN 需要创建虚拟网卡, 没权限会静默失败; 而客户端此时已经把系统代理关了,
+   于是变成"TUN 没起来 + 系统代理也没了"的双重断网。
+
+4. DNS 不要只押一个 DoH
+   若所有域名都走 https://cloudflare-dns.com/dns-query 并经代理出去,
+   节点一抖 DNS 就全超时, 表现同样是全断。
+   建议国内域名走 223.5.5.5 直连, 只有需要代理的才走远程解析。
+
+## 三、卡住时怎么定位
+
+TUN 开着的情况下依次执行(Windows):
+
+    ping 1.1.1.1             通 -> 路由正常, 问题在 DNS; 不通 -> 网卡或路由没起来
+    ipconfig /all            看是否多出一块 TUN 网卡、是否拿到 IP
+    route print              看默认路由 0.0.0.0 指向哪块网卡
+    nslookup www.baidu.com   看 DNS 是否可用
+
+## 四、Windows 上 v2rayN 还差一个文件
+
+v2rayN 的 TUN 由 sing-box 内核实现, 需要 wintun.dll。
+若 bin\\sing_box\\ 目录里没有该文件, 把 bin\\xray\\wintun.dll 复制过去即可,
+否则 TUN 网卡根本创建不出来。
+GUIDE
+  chmod 644 "$tdir/client-guide.md"
 
   chmod -R 755 "$tdir"
   SUB_TOKEN_DIR="$tdir"
@@ -859,7 +1036,13 @@ print_links(){
   hr
   echo "密码      : ${HY2_PASS}"
   echo "SNI       : ${DEST}"
-  echo "跳过证书验证: 开启 (insecure=1)"
+  if [ -n "${HY2_PIN:-}" ]; then
+    echo "证书固定  : 已启用 (pinSHA256, 无需 insecure)"
+    echo "  指纹    : ${HY2_PIN}"
+    [ -n "${CERT_HEX:-}" ] && echo "  mihomo  : fingerprint: ${CERT_HEX}"
+  else
+    echo -e "${Y}跳过证书验证: 开启 (insecure=1) —— 链路上可被冒充${N}"
+  fi
   [ -n "${HY2_HOP:-}" ] && echo "端口跳跃  : ${HY2_HOP}"
   [ "$ENABLE_OBFS" = "1" ] && echo "混淆      : salamander / ${OBFS_PASS}"
   echo
@@ -887,6 +1070,7 @@ print_sub_info(){
   echo "  base64.txt     通用订阅, 小火箭 / v2rayN / v2rayNG 可直接导入"
   echo "  clash.yaml     Clash / mihomo / Clash Verge"
   echo "  singbox.json   sing-box 客户端"
+  echo "  client-guide.md 客户端配置指南(证书固定 / TUN 参数 / 排障)"
   if [ "$SUB_HTTP" = "1" ] && [ -n "${SUB_PORT:-}" ] && [ -n "${SUB_TOKEN:-}" ]; then
     echo
     echo "HTTP 订阅(需安全组放行 TCP ${SUB_PORT}):"
@@ -905,7 +1089,11 @@ self_check(){
   local code
   code=$(curl -s --socks5-hostname 127.0.0.1:10899 -o /dev/null -w '%{http_code}' --max-time 15 https://www.tiktok.com 2>/dev/null)
   info "TikTok 连通性: HTTP ${code:-000}"
-  if verify_hy2; then ok "Hysteria2 链路: 通过"; else warn "Hysteria2 链路: 未验证通过(本机 UDP 回环可能受限, 以客户端实测为准)"; fi
+  if verify_hy2 "${HY2_PIN:-}"; then
+    if [ -n "${HY2_PIN:-}" ]; then ok "Hysteria2 链路: 通过 (证书固定已验证, 无 insecure)"; else ok "Hysteria2 链路: 通过 (insecure)"; fi
+  else
+    warn "Hysteria2 链路: 未验证通过(本机 UDP 回环可能受限, 以客户端实测为准)"
+  fi
 }
 
 # ---------------- 安装主流程 ----------------
@@ -993,7 +1181,13 @@ cmd_install(){
     echo "端口(UDP): ${HY2_PORT}"
     echo "密码     : ${HY2_PASS}"
     echo "SNI      : ${DEST}"
-    echo "insecure : 1"
+    if [ -n "${HY2_PIN:-}" ]; then
+      echo "证书固定 : pinSHA256"
+      echo "指纹     : ${HY2_PIN}"
+      echo "mihomo   : fingerprint: ${CERT_HEX:-}"
+    else
+      echo "insecure : 1"
+    fi
     [ -n "${HY2_HOP:-}" ] && echo "端口跳跃 : ${HY2_HOP}"
     [ "$ENABLE_OBFS" = "1" ] && echo "混淆     : salamander / ${OBFS_PASS}"
     echo "链接     : ${HY2_LINK}"
@@ -1270,7 +1464,12 @@ cmd_uninstall(){
   systemctl daemon-reload
   rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/hysteria "$SUB_DIR" "$STATE_DIR"
   rm -f "$XRAY_BIN" "$HY2_BIN" "/usr/local/bin/${APP_NAME}" /root/proxy-info.txt \
-        /usr/local/bin/proxy-healthcheck.sh
+        /usr/local/bin/proxy-healthcheck.sh \
+        /etc/sysctl.d/99-proxy-optimize.conf \
+        /etc/systemd/journald.conf.d/99-proxy-size.conf
+  # 还原系统级参数(swap 保留, 留着不影响下次部署)
+  sysctl --system >/dev/null 2>&1 || true
+  systemctl restart systemd-journald >/dev/null 2>&1 || true
   if [ -n "${HY2_HOP:-}" ]; then
     local s="${HY2_HOP%%-*}" e="${HY2_HOP##*-}"
     iptables -t nat -D PREROUTING -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
@@ -1348,6 +1547,7 @@ Proxy Node Installer v2
   REALITY_DEST=www.bing.com      指定伪装站(留空=自动挑选)
   ENABLE_OBFS=1                  开启 hy2 salamander 混淆
   HY2_HOP=20000-30000            hy2 UDP 端口跳跃
+  HY2_INSECURE=1                 关闭证书固定, 退回 insecure(不推荐)
   SUB_HTTP=1                     起订阅 HTTP 服务
   ASSUME_YES=1                   全程不询问
 
