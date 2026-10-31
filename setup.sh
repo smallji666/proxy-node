@@ -14,20 +14,25 @@
 #     bash setup-proxy.sh restart      重启服务
 #     bash setup-proxy.sh logs         实时日志
 #     bash setup-proxy.sh reset        重置凭据(换 UUID / 密钥)
-#     bash setup-proxy.sh uninstall    卸载
-#     bash setup-proxy.sh upgrade      升级内核(危险, 见警告)
+#     bash setup-proxy.sh backup       打包状态/凭据/证书, 用于迁移
+#     bash setup-proxy.sh restore <f>  从备份恢复(换 VPS 时用)
+#     bash setup-proxy.sh clean        清除所有配置与服务(端口占用时用这个)
+#     bash setup-proxy.sh uninstall    卸载(等同 clean)
+#     bash setup-proxy.sh upgrade [版本]  升级内核, --rollback 回滚
 #  环境变量(首次安装生效):
 #     VLESS_PORT=443  HY2_PORT=443  REALITY_DEST=www.bing.com
 #     ENABLE_OBFS=1   开启 hy2 salamander 混淆
 #     HY2_HOP=20000-30000   hy2 UDP 端口跳跃
 #     HY2_INSECURE=1  关闭证书固定, 退回 insecure (不推荐, 仅临时调试)
 #     SUB_HTTP=1      起一个订阅 HTTP 服务(默认关)
+#     SUB_BIND=0.0.0.0  订阅服务监听地址(默认 127.0.0.1, 只允许本机/SSH 隧道)
+#     CLEAN=1         安装前先彻底清理旧实例(解决端口被占用)
 #     ASSUME_YES=1    全程不询问
 # ============================================================
 set -uo pipefail
 
 APP_NAME="proxy"
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 STATE_DIR="/etc/proxy-node"
 STATE_FILE="${STATE_DIR}/state.env"
 USERS_FILE="${STATE_DIR}/users.txt"
@@ -47,6 +52,7 @@ _RAW_HY2_HOP="${HY2_HOP-__unset__}"
 _RAW_HY2_INSECURE="${HY2_INSECURE-__unset__}"
 _RAW_SUB_HTTP="${SUB_HTTP-__unset__}"
 _RAW_SUB_PORT="${SUB_PORT-__unset__}"
+_RAW_SUB_BIND="${SUB_BIND-__unset__}"
 _RAW_NODE_NAME="${NODE_NAME-__unset__}"
 
 # ---------------- 默认参数 ----------------
@@ -59,6 +65,8 @@ HY2_HOP="${HY2_HOP:-}"
 HY2_INSECURE="${HY2_INSECURE:-0}"
 SUB_HTTP="${SUB_HTTP:-0}"
 SUB_PORT="${SUB_PORT:-}"
+SUB_BIND="${SUB_BIND:-127.0.0.1}"
+CLEAN="${CLEAN:-0}"
 NODE_NAME="${NODE_NAME:-Node}"
 NODE_NAME="${NODE_NAME// /-}"
 ASSUME_YES="${ASSUME_YES:-0}"
@@ -133,6 +141,7 @@ save_state(){
     echo "CERT_HEX='${CERT_HEX:-}'"
     echo "SUB_TOKEN='${SUB_TOKEN:-}'"
     echo "SUB_PORT='${SUB_PORT:-}'"
+    echo "SUB_BIND='${SUB_BIND}'"
     echo "SUB_HTTP='${SUB_HTTP}'"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -148,6 +157,7 @@ apply_env_overrides(){
   [ "$_RAW_HY2_INSECURE" != "__unset__" ] && HY2_INSECURE="$_RAW_HY2_INSECURE"
   [ "$_RAW_SUB_HTTP"     != "__unset__" ] && SUB_HTTP="$_RAW_SUB_HTTP"
   [ "$_RAW_SUB_PORT"     != "__unset__" ] && SUB_PORT="$_RAW_SUB_PORT"
+  [ "$_RAW_SUB_BIND"     != "__unset__" ] && SUB_BIND="$_RAW_SUB_BIND"
   if [ "$_RAW_NODE_NAME" != "__unset__" ]; then
     NODE_NAME="${_RAW_NODE_NAME// /-}"
   fi
@@ -208,7 +218,30 @@ get_server_ip(){
 }
 
 port_in_use(){
-  ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"
+  local proto="${2:-tcp}" flag="-tln"
+  [ "$proto" = "udp" ] && flag="-uln"
+  ss "$flag" 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"
+}
+
+# 占用端口的进程, 输出 "名字(pid)"; 查不到返回空
+port_owner(){
+  local proto="${2:-tcp}" flag="-tlnp" out
+  [ "$proto" = "udp" ] && flag="-ulnp"
+  out=$(ss "$flag" 2>/dev/null | awk -v p=":${1}" '$4 ~ (p "$") {print $NF; exit}')
+  [ -n "$out" ] || return 1
+  echo "$out" | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/\1(\2)/p'
+}
+
+kill_port_owner(){
+  local proto="${2:-tcp}" flag="-tlnp" pid
+  [ "$proto" = "udp" ] && flag="-ulnp"
+  pid=$(ss "$flag" 2>/dev/null | awk -v p=":${1}" '$4 ~ (p "$") {print $NF; exit}' \
+        | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+  [ -n "$pid" ] || return 1
+  kill "$pid" 2>/dev/null || true
+  sleep 1
+  kill -9 "$pid" 2>/dev/null || true
+  return 0
 }
 
 # ---------------- 下载 ----------------
@@ -761,26 +794,69 @@ JOURNAL
 install_healthcheck(){
   cat > /usr/local/bin/proxy-healthcheck.sh <<'HEALTH'
 #!/usr/bin/env bash
-# 由 proxy-installer 安装: 定时检查服务与端口, 异常自动拉起
+# 由 proxy-installer 安装
+# 每 5 分钟查进程/端口; 每 6 次(约 30 分钟)做一次真实隧道探测, 连续失败才重启
 set -u
 ST=/etc/proxy-node/state.env
+FAIL=/run/proxy-healthcheck.fail
+TICK=/run/proxy-healthcheck.tick
 [ -f "$ST" ] || exit 0
 # shellcheck disable=SC1090
 . "$ST"
 
-bad=0
-systemctl is-active --quiet xray || bad=1
-if [ "$bad" = "0" ] && ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${VLESS_PORT}$"; then
-  bad=1
-fi
-if [ "$bad" = "1" ]; then
+restart_xray(){
   systemctl restart xray >/dev/null 2>&1
-  logger -t proxy-healthcheck "xray 异常, 已尝试重启"
+  logger -t proxy-healthcheck "xray 异常($1), 已重启"
+  echo 0 > "$FAIL" 2>/dev/null || true
+}
+
+if ! systemctl is-active --quiet xray; then restart_xray "进程不在"; fi
+if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${VLESS_PORT}$"; then
+  restart_xray "端口未监听"
+fi
+
+n=$(cat "$TICK" 2>/dev/null || echo 0)
+case "$n" in ''|*[!0-9]*) n=0 ;; esac
+n=$(( n + 1 ))
+echo "$n" > "$TICK" 2>/dev/null || true
+
+if [ $(( n % 6 )) -eq 0 ]; then
+  U=$(head -1 /etc/proxy-node/users.txt 2>/dev/null | cut -d'|' -f1)
+  U=${U:-${UUID:-}}
+  if [ -n "$U" ] && [ -n "${DEST:-}" ]; then
+    cat > /run/_hc.json <<JSON
+{ "log": { "loglevel": "error" },
+  "inbounds": [ { "port": 10896, "listen": "127.0.0.1", "protocol": "socks", "settings": { "udp": false } } ],
+  "outbounds": [ { "protocol": "vless",
+    "settings": { "vnext": [ { "address": "127.0.0.1", "port": ${VLESS_PORT},
+      "users": [ { "id": "${U}", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
+    "streamSettings": { "network": "tcp", "security": "reality",
+      "realitySettings": { "serverName": "${DEST}", "fingerprint": "chrome",
+        "publicKey": "${PUB:-}", "shortId": "${SID:-}", "spiderX": "/" } } } ] }
+JSON
+    /usr/local/bin/xray -c /run/_hc.json >/dev/null 2>&1 &
+    hp=$!
+    sleep 3
+    code=$(curl -s --socks5-hostname 127.0.0.1:10896 -o /dev/null -w '%{http_code}' --max-time 10 https://www.gstatic.com/generate_204 2>/dev/null)
+    kill "$hp" >/dev/null 2>&1
+    rm -f /run/_hc.json
+    case "$code" in
+      2*|3*) echo 0 > "$FAIL" 2>/dev/null || true ;;
+      *)
+        f=$(cat "$FAIL" 2>/dev/null || echo 0)
+        case "$f" in ''|*[!0-9]*) f=0 ;; esac
+        f=$(( f + 1 ))
+        echo "$f" > "$FAIL" 2>/dev/null || true
+        logger -t proxy-healthcheck "隧道探测失败(HTTP ${code:-000}), 连续 ${f} 次"
+        [ "$f" -ge 2 ] && restart_xray "隧道连续不可用"
+        ;;
+    esac
+  fi
 fi
 
 if ! systemctl is-active --quiet hysteria-server; then
   systemctl restart hysteria-server >/dev/null 2>&1
-  logger -t proxy-healthcheck "hysteria2 异常, 已尝试重启"
+  logger -t proxy-healthcheck "hysteria2 异常, 已重启"
 fi
 HEALTH
   chmod 755 /usr/local/bin/proxy-healthcheck.sh
@@ -1045,7 +1121,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${SUB_DIR}
-ExecStart=$(command -v python3) -m http.server ${SUB_PORT} --bind 0.0.0.0 --directory ${SUB_DIR}
+ExecStart=$(command -v python3) -m http.server ${SUB_PORT} --bind ${SUB_BIND} --directory ${SUB_DIR}
 Restart=on-failure
 RestartSec=3
 
@@ -1057,10 +1133,17 @@ EOF
   systemctl restart proxy-sub >/dev/null 2>&1
   sleep 1
   if systemctl is-active --quiet proxy-sub; then
-    ok "订阅 HTTP 服务已启动 (端口 ${SUB_PORT})"
-    warn "订阅地址含节点密钥, 请勿外传; 停用: systemctl disable --now proxy-sub"
+    ok "订阅服务已启动: ${SUB_BIND}:${SUB_PORT}"
+    if [ "$SUB_BIND" = "127.0.0.1" ]; then
+      echo -e "${D}仅监听本机, 取订阅请先建 SSH 隧道:${N}"
+      echo -e "${D}  ssh -N -L ${SUB_PORT}:127.0.0.1:${SUB_PORT} root@${SERVER_IP:-<服务器IP>}${N}"
+      echo -e "${D}  然后访问 http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN:-<token>}/clash.yaml${N}"
+    else
+      warn "订阅服务已对 ${SUB_BIND} 开放: token 即凭据, 请勿外传"
+    fi
+    echo -e "${D}停用: systemctl disable --now proxy-sub${N}"
   else
-    warn "订阅 HTTP 服务启动失败, 已跳过"
+    warn "订阅服务启动失败, 已跳过"
   fi
 }
 
@@ -1126,10 +1209,18 @@ print_sub_info(){
   echo "  client-guide.md 客户端配置指南(证书固定 / TUN 参数 / 排障)"
   if [ "$SUB_HTTP" = "1" ] && [ -n "${SUB_PORT:-}" ] && [ -n "${SUB_TOKEN:-}" ]; then
     echo
-    echo "HTTP 订阅(需安全组放行 TCP ${SUB_PORT}):"
-    echo "  Clash   : http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}/clash.yaml"
-    echo "  通用    : http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}/base64.txt"
-    echo "  singbox : http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}/singbox.json"
+    if [ "${SUB_BIND:-127.0.0.1}" = "127.0.0.1" ]; then
+      echo "订阅服务(仅监听本机), 先在本地建隧道:"
+      echo "  ssh -N -L ${SUB_PORT}:127.0.0.1:${SUB_PORT} root@${SERVER_IP}"
+      echo "  Clash   : http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}/clash.yaml"
+      echo "  通用    : http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}/base64.txt"
+      echo "  singbox : http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}/singbox.json"
+    else
+      echo "订阅服务(${SUB_BIND}:${SUB_PORT}, 需安全组放行 TCP ${SUB_PORT}):"
+      echo "  Clash   : http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}/clash.yaml"
+      echo "  通用    : http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}/base64.txt"
+      echo "  singbox : http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}/singbox.json"
+    fi
   else
     echo
     echo -e "${D}未启用 HTTP 订阅。用 FinalShell 文件面板把需要的文件下载到本机导入即可。${N}"
@@ -1195,10 +1286,37 @@ cmd_install(){
   install_deps
   preflight
 
-  if [ "$fresh" = "1" ] && port_in_use "$VLESS_PORT"; then
-    warn "TCP ${VLESS_PORT} 已被占用:"
-    ss -tlnp 2>/dev/null | awk -v p=":${VLESS_PORT}" 'index($4,p)>0'
-    die "请释放端口, 或用 VLESS_PORT=8443 bash setup-proxy.sh 重新运行"
+  if [ "$CLEAN" = "1" ]; then
+    info "CLEAN=1: 先清理旧实例再安装"
+    do_clean 0
+    # 清掉内存里的旧凭据, 否则会"复用"刚删掉的那套
+    UUID=""; PRIV=""; PUB=""; SID=""; DEST=""
+    HY2_PASS=""; OBFS_PASS=""; SUB_TOKEN=""; SERVER_IP=""
+    fresh=1
+  fi
+
+  if [ "$fresh" = "1" ]; then
+    local owner=""
+    owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
+    if [ -n "$owner" ]; then
+      warn "TCP ${VLESS_PORT} 已被占用: ${owner}"
+      ss -tlnp 2>/dev/null | awk -v p=":${VLESS_PORT}" '$4 ~ (p "$")'
+      echo
+      if echo "$owner" | grep -qE '^(xray|hysteria)'; then
+        if ask_yes "这是本脚本残留的实例, 清理后继续?"; then
+          do_clean 0
+          sleep 1
+        fi
+      else
+        if ask_yes "结束该进程(${owner})并继续?"; then
+          kill_port_owner "$VLESS_PORT" tcp
+          sleep 1
+        fi
+      fi
+      if port_in_use "$VLESS_PORT" tcp; then
+        die "端口仍被占用。可执行 bash setup-proxy.sh clean 清理, 或换端口: VLESS_PORT=8443 bash setup-proxy.sh install"
+      fi
+    fi
   fi
 
   ensure_xray
@@ -1561,6 +1679,80 @@ cmd_user(){
   esac
 }
 
+# ---------------- 备份 / 迁移 ----------------
+cmd_backup(){
+  need_root
+  local out="${1:-/root/proxy-backup-$(date +%Y%m%d-%H%M%S).tar.gz}"
+  local tmp; tmp=$(mktemp -d)
+  mkdir -p "$tmp/etc-proxy-node" "$tmp/etc-hysteria"
+
+  [ -d "$STATE_DIR" ] && cp -a "$STATE_DIR/." "$tmp/etc-proxy-node/" 2>/dev/null
+  [ -f /etc/hysteria/cert.pem ] && cp -a /etc/hysteria/cert.pem /etc/hysteria/key.pem "$tmp/etc-hysteria/" 2>/dev/null
+  [ -f /root/proxy-info.txt ] && cp -a /root/proxy-info.txt "$tmp/" 2>/dev/null
+
+  if [ -z "$(ls -A "$tmp/etc-proxy-node" 2>/dev/null)" ]; then
+    rm -rf "$tmp"
+    die "没有可备份的内容, 先安装: bash setup-proxy.sh install"
+  fi
+
+  tar -czf "$out" -C "$tmp" . || { rm -rf "$tmp"; die "打包失败"; }
+  chmod 600 "$out"
+  rm -rf "$tmp"
+  ok "已备份: ${out}  ($(du -h "$out" 2>/dev/null | awk '{print $1}'))"
+  echo -e "${D}含全部凭据与私钥, 权限 600, 请勿外传${N}"
+  echo -e "${D}迁移到新 VPS: 拷过去后 proxy restore <文件>${N}"
+}
+
+cmd_restore(){
+  need_root
+  local f="${1:-}" tmp
+  [ -n "$f" ] && [ -f "$f" ] || die "用法: proxy restore /root/proxy-backup-xxx.tar.gz"
+
+  # 防路径穿越: 含绝对路径或 .. 的备份包直接拒绝
+  if tar -tzf "$f" 2>/dev/null | grep -qE '^/|(^|/)\.\.(/|$)'; then
+    die "备份包内含非法路径, 已中止"
+  fi
+
+  ask_yes "恢复会覆盖当前配置与凭据, 确认?" || { info "已取消"; return 0; }
+
+  tmp=$(mktemp -d)
+  tar -xzf "$f" -C "$tmp" || { rm -rf "$tmp"; die "解压失败"; }
+
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  [ -d "$tmp/etc-proxy-node" ] && cp -a "$tmp/etc-proxy-node/." "$STATE_DIR/" 2>/dev/null
+  if [ -d "$tmp/etc-hysteria" ]; then
+    mkdir -p /etc/hysteria
+    cp -a "$tmp/etc-hysteria/." /etc/hysteria/ 2>/dev/null
+    chmod 600 /etc/hysteria/key.pem 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+  [ -f "$USERS_FILE" ] && chmod 600 "$USERS_FILE"
+
+  load_state || die "恢复后的状态文件无法读取"
+
+  # 换 VPS 时公网 IP 会变, 重新探测, 否则链接里还是旧地址
+  SERVER_IP=$(get_server_ip)
+  info "服务器 IP: ${SERVER_IP:-未知}"
+
+  ensure_xray
+  ensure_xray_service
+  write_xray_config "$DEST"
+  systemctl restart xray >/dev/null 2>&1
+  sleep 2
+  systemctl is-active --quiet xray || die "xray 启动失败, 查看: journalctl -u xray -n 30"
+  ensure_hy2
+  setup_firewall
+  install_healthcheck
+  save_state
+  gen_links
+  gen_sub_files
+  maybe_sub_http
+  save_state
+  print_links
+  ok "恢复完成, 凭据与设备列表都已沿用"
+}
+
 cmd_reset(){
   need_root
   load_state || die "尚未安装"
@@ -1584,51 +1776,150 @@ cmd_reset(){
 
 cmd_upgrade(){
   need_root
-  echo
-  err "危险操作: Xray >= 26.9.8 会强制要求客户端携带 X25519MLKEM768"
-  echo "  小火箭没有该开关, 升级后会「开关变绿但网页打不开」。"
-  echo "  mihomo 系需在配置里加 reality-opts.support-x25519mlkem768: true"
-  echo
-  ask_yes "仍然继续升级到最新版?" || { info "已取消"; return 0; }
-  local tmp asset
+  local target="${1:-latest}" asset tmp
   case "$(uname -m)" in
     x86_64|amd64)  asset="Xray-linux-64.zip" ;;
     aarch64|arm64) asset="Xray-linux-arm64-v8a.zip" ;;
     *) die "不支持的架构" ;;
   esac
+
+  # 回滚: 用 upgrade 时留下的上一版二进制
+  if [ "$target" = "--rollback" ] || [ "$target" = "rollback" ]; then
+    [ -x "${XRAY_BIN}.prev" ] || die "没有可回滚的版本(只有执行过 upgrade 才会留下备份)"
+    systemctl stop xray >/dev/null 2>&1
+    cp -f "${XRAY_BIN}.prev" "$XRAY_BIN"
+    systemctl start xray >/dev/null 2>&1
+    sleep 2
+    systemctl is-active --quiet xray || die "回滚后启动失败, 查看: journalctl -u xray -n 30"
+    ok "已回滚: $($XRAY_BIN version 2>/dev/null | head -1)"
+    return 0
+  fi
+
+  if [ "$target" = "latest" ] || version_ge "$target" "26.9.8"; then
+    echo
+    err "注意: Xray >= 26.9.8 会强制要求客户端携带 X25519MLKEM768"
+    echo "  小火箭没有该开关, 升级后会「开关变绿但网页打不开」。"
+    echo "  mihomo 系需在配置里加 reality-opts.support-x25519mlkem768: true"
+    echo
+  fi
+
+  local url
+  if [ "$target" = "latest" ]; then
+    url="https://github.com/XTLS/Xray-core/releases/latest/download/${asset}"
+  else
+    url="https://github.com/XTLS/Xray-core/releases/download/v${target}/${asset}"
+  fi
+
+  ask_yes "安装 Xray ${target}?  当前: $($XRAY_BIN version 2>/dev/null | head -1)" || { info "已取消"; return 0; }
+
   tmp=$(mktemp -d)
-  download_with_mirror "https://github.com/XTLS/Xray-core/releases/latest/download/${asset}" "$tmp/x.zip" || die "下载失败"
-  unzip -o -q "$tmp/x.zip" -d "$tmp/pkg" || die "解压失败"
+  download_with_mirror "$url" "$tmp/x.zip" || { rm -rf "$tmp"; die "下载失败(版本号是否存在?)"; }
+  unzip -o -q "$tmp/x.zip" -d "$tmp/pkg" || { rm -rf "$tmp"; die "解压失败"; }
+  [ -f "$tmp/pkg/xray" ] || { rm -rf "$tmp"; die "压缩包内未找到 xray"; }
+
+  # 留一份当前版本, 便于 --rollback
+  [ -x "$XRAY_BIN" ] && cp -f "$XRAY_BIN" "${XRAY_BIN}.prev"
   systemctl stop xray >/dev/null 2>&1
   install -m 755 "$tmp/pkg/xray" "$XRAY_BIN"
   rm -rf "$tmp"
-  systemctl start xray >/dev/null 2>&1; sleep 2
-  ok "已升级: $($XRAY_BIN version 2>/dev/null | head -1)"
-  warn "回滚: XRAY_VERSION=26.3.27 bash $(readlink -f "$0" 2>/dev/null) install"
+  systemctl start xray >/dev/null 2>&1
+  sleep 2
+  if ! systemctl is-active --quiet xray; then
+    warn "新版本启动失败, 自动回滚"
+    cp -f "${XRAY_BIN}.prev" "$XRAY_BIN" 2>/dev/null
+    systemctl start xray >/dev/null 2>&1
+    die "已回滚到上一版本, 查看: journalctl -u xray -n 30"
+  fi
+  ok "已安装: $($XRAY_BIN version 2>/dev/null | head -1)"
+  echo -e "${D}回滚: proxy upgrade --rollback${N}"
 }
 
-cmd_uninstall(){
-  need_root
-  warn "将停止并删除 xray / hysteria2 服务、配置与订阅文件"
-  ask_yes "确认卸载?" || { info "已取消"; return 0; }
-  systemctl disable --now xray hysteria-server hy2-hop proxy-sub proxy-healthcheck.timer >/dev/null 2>&1
+# ---------------- 清理 ----------------
+# 只删本脚本创建的东西; remove_script=1 时连管理命令与脚本一起删
+do_clean(){
+  local remove_script="${1:-0}" hop="" hp="" p o
+
+  # 状态目录随后就被删, 先把端口跳跃信息读出来
+  if load_state 2>/dev/null; then
+    hop="${HY2_HOP:-}"
+    hp="${HY2_PORT:-}"
+  fi
+
+  systemctl disable --now xray hysteria-server hy2-hop proxy-sub proxy-healthcheck.timer >/dev/null 2>&1 || true
+
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/hysteria-server.service \
         /etc/systemd/system/hy2-hop.service /etc/systemd/system/proxy-sub.service \
         /etc/systemd/system/proxy-healthcheck.service /etc/systemd/system/proxy-healthcheck.timer
-  systemctl daemon-reload
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  # 只杀本脚本自己的二进制, 不碰系统里其它程序
+  pkill -f '^/usr/local/bin/xray' >/dev/null 2>&1 || true
+  pkill -f '^/usr/local/bin/hysteria' >/dev/null 2>&1 || true
+  sleep 1
+
+  # 端口跳跃的 NAT 规则(可能残留多条)
+  if [ -n "$hop" ] && [ -n "$hp" ]; then
+    while iptables -t nat -C PREROUTING -p udp --dport "$hop" -j REDIRECT --to-ports "$hp" 2>/dev/null; do
+      iptables -t nat -D PREROUTING -p udp --dport "$hop" -j REDIRECT --to-ports "$hp" 2>/dev/null || break
+    done
+  fi
+
   rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/hysteria "$SUB_DIR" "$STATE_DIR"
-  rm -f "$XRAY_BIN" "$HY2_BIN" "/usr/local/bin/${APP_NAME}" /root/proxy-info.txt \
+  rm -f "$XRAY_BIN" "${XRAY_BIN}.prev" "$HY2_BIN" /root/proxy-info.txt \
         /usr/local/bin/proxy-healthcheck.sh \
         /etc/sysctl.d/99-proxy-optimize.conf \
         /etc/systemd/journald.conf.d/99-proxy-size.conf
-  # 还原系统级参数(swap 保留, 留着不影响下次部署)
   sysctl --system >/dev/null 2>&1 || true
   systemctl restart systemd-journald >/dev/null 2>&1 || true
-  if [ -n "${HY2_HOP:-}" ]; then
-    local s="${HY2_HOP%%-*}" e="${HY2_HOP##*-}"
-    iptables -t nat -D PREROUTING -p udp --dport "${s}:${e}" -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
+  rm -f /run/proxy-healthcheck.fail /run/proxy-healthcheck.tick
+
+  if [ "$remove_script" = "1" ]; then
+    rm -f "/usr/local/bin/${APP_NAME}" /root/setup-proxy.sh
   fi
-  ok "已卸载"
+
+  # 复查端口是否真的空了
+  for p in "${VLESS_PORT:-443}" "${HY2_PORT:-443}"; do
+    o=$(port_owner "$p" tcp) || o=""
+    [ -n "$o" ] && warn "TCP ${p} 仍被其它进程占用: ${o}"
+    o=$(port_owner "$p" udp) || o=""
+    [ -n "$o" ] && warn "UDP ${p} 仍被其它进程占用: ${o}"
+  done
+  return 0
+}
+
+cmd_clean(){
+  need_root
+  local remove_script=0 force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --all|--purge)   remove_script=1 ;;
+      --yes|-y|--force) force=1 ;;
+    esac
+  done
+
+  echo
+  err "即将清除本脚本创建的全部内容"
+  echo "  服务   xray / hysteria-server / hy2-hop / proxy-sub / proxy-healthcheck"
+  echo "  配置   ${XRAY_CFG}"
+  echo "         ${HY2_CFG}"
+  echo "         ${STATE_DIR}   (含全部凭据与设备列表)"
+  echo "  订阅   ${SUB_DIR}"
+  echo "  系统   sysctl 优化项 / journald 限容 / 端口跳跃 iptables 规则"
+  [ "$remove_script" = "1" ] && echo "  脚本   管理命令 ${APP_NAME} 与 /root/setup-proxy.sh"
+  echo
+  echo -e "${D}swap 会保留(不影响重装); 不会动系统里的其它服务${N}"
+  echo
+  if [ "$force" != "1" ] && [ "$ASSUME_YES" != "1" ]; then
+    ask_yes "确认清除?" || { info "已取消"; return 0; }
+  fi
+
+  do_clean "$remove_script"
+  ok "已清除, 端口应已释放"
+  if [ "$remove_script" != "1" ]; then
+    echo -e "${D}管理命令 ${APP_NAME} 仍在, 运行 ${APP_NAME} 选 1 即可重新部署${N}"
+  fi
+  echo
 }
 
 # ---------------- 菜单 ----------------
@@ -1655,7 +1946,9 @@ menu(){
     echo "  8) 线路体检 (出口 IP / PTR / 时间 / 客户端清单)"
     echo "  a) 设备凭据 (多设备 UUID / 单独吊销)"
     echo "  9) 重置凭据 (换 UUID/密钥, 需重新导入)"
-    echo "  u) 卸载"
+    echo "  b) 备份配置 (迁移到新 VPS 用)"
+    echo "  c) 清除所有配置 (端口被占用时用这个)"
+    echo "  u) 卸载 (等同清除)"
     echo "  0) 退出"
     echo
     local c=""
@@ -1671,7 +1964,9 @@ menu(){
       8) cmd_audit ;;
       a|A) cmd_user list ;;
       9) cmd_reset ;;
-      u|U) cmd_uninstall ;;
+      b|B) cmd_backup ;;
+      c|C) cmd_clean ;;
+      u|U) cmd_clean ;;
       0|q|Q) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -1696,8 +1991,11 @@ Proxy Node Installer v3
   audit [--dnsbl]  线路体检(出口 IP / PTR / 时间 / 客户端清单)
   user [子命令]    多设备凭据: list(默认) / add <名字> / link <名字> / rm <名字>
   reset            重置凭据(会作废现有客户端)
-  uninstall        卸载
-  upgrade          升级 Xray 内核(危险, 默认不建议)
+  backup [文件]    打包状态/凭据/证书, 用于迁移
+  restore <文件>   从备份恢复(换 VPS 时用, 会自动重新探测 IP)
+  clean [--all]    清除所有配置与服务(端口被占用时用这个)
+  uninstall        等同 clean
+  upgrade [版本]   升级 Xray 内核; upgrade --rollback 回滚上一版
 
 首次安装可用的环境变量:
   VLESS_PORT=443  HY2_PORT=443
@@ -1706,10 +2004,14 @@ Proxy Node Installer v3
   HY2_HOP=20000-30000            hy2 UDP 端口跳跃
   HY2_INSECURE=1                 关闭证书固定, 退回 insecure(不推荐)
   SUB_HTTP=1                     起订阅 HTTP 服务
+  SUB_BIND=0.0.0.0               订阅服务监听地址(默认 127.0.0.1)
+  CLEAN=1                        安装前先彻底清理旧实例
   ASSUME_YES=1                   全程不询问
 
 示例:
   bash setup-proxy.sh
+  CLEAN=1 bash setup-proxy.sh install          端口被占用时一条命令重来
+  bash setup-proxy.sh clean --all             连管理命令一起删干净
   VLESS_PORT=8443 HY2_PORT=8443 bash setup-proxy.sh install
   ENABLE_OBFS=1 HY2_HOP=20000-30000 bash setup-proxy.sh install
 USAGE
@@ -1727,8 +2029,10 @@ main(){
     audit)          cmd_audit "${2:-}" ;;
     user)           cmd_user "${2:-list}" "${3:-}" ;;
     reset)          cmd_reset ;;
-    uninstall)      cmd_uninstall ;;
-    upgrade)        cmd_upgrade ;;
+    backup)         cmd_backup "${2:-}" ;;
+    restore)        cmd_restore "${2:-}" ;;
+    clean|uninstall|purge) cmd_clean "${2:-}" "${3:-}" ;;
+    upgrade)        cmd_upgrade "${2:-}" ;;
     help|-h|--help) usage ;;
     "")
       if load_state 2>/dev/null; then menu; else cmd_install; fi

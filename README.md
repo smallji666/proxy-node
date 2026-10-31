@@ -17,6 +17,9 @@
 | 自动选伪装站 | 遍历候选站点，**用真实 REALITY 握手验证**通过才采用 |
 | 幂等安装 | 凭据持久化，重跑脚本不会重置 UUID，已有客户端不失效 |
 | 多设备凭据 | 每台设备一条 UUID，可单独吊销；丢手机不影响其他设备 |
+| 一键清理 | `proxy clean` 停服务、删配置、清 iptables/sysctl、杀残留进程，端口被占用时一条命令重来 |
+| 备份迁移 | `proxy backup` 打包凭据与证书，换 VPS 时 `restore` 直接沿用，不用重新导入客户端 |
+| 隧道自检 | 健康检查每 30 分钟真跑一次 REALITY 握手，连续失败才重启，避免误杀 |
 | 订阅生成 | 自动产出 `clash.yaml` / `singbox.json` / `base64` 通用订阅 / 原始链接 |
 | 端口跳跃 | Hysteria2 UDP 端口区间跳跃，绕开单端口 QoS |
 | 管理命令 | 安装后可用 `proxy` 打开菜单，或用子命令直接操作 |
@@ -62,7 +65,10 @@ proxy logs           # 实时日志（proxy logs hy2 看 hysteria2）
 proxy audit          # 线路体检：出口 IP / PTR / 时间同步 / 客户端清单
 proxy user           # 设备凭据：list / add <名字> / link <名字> / rm <名字>
 proxy reset          # 重置凭据（会作废所有已导入客户端）
-proxy uninstall      # 卸载
+proxy backup         # 打包凭据与证书（迁移用）
+proxy restore <文件> # 从备份恢复
+proxy clean          # 清除所有配置与服务（端口被占用时用这个）
+proxy upgrade 26.3.27  # 装指定版本；proxy upgrade --rollback 回滚上一版
 ```
 
 也可以继续用脚本本身：`bash /root/setup-proxy.sh info`
@@ -84,6 +90,44 @@ proxy user rm iPhone       # 吊销，这条链接立即失效
 
 凭据存在 `/etc/proxy-node/users.txt`（权限 600），格式 `UUID|名字|日期`。
 订阅文件取第一条凭据，所以删掉第一条时订阅会自动换用新的第一条，不会失效。
+
+---
+
+## 端口被占用 / 重装
+
+重装最常卡在端口上：上次的服务没停干净，或者 `/etc/proxy-node` 删了但进程还在跑。
+
+三条路，按顺序试：
+
+```bash
+# 1. 交互清理：安装时检测到占用会问你要不要清掉
+bash setup-proxy.sh install
+
+# 2. 一条命令先清干净再装（无人值守）
+CLEAN=1 bash setup-proxy.sh install
+
+# 3. 只清理，不装
+proxy clean            # 保留 proxy 命令，方便随后重装
+proxy clean --all      # 连管理命令和脚本一起删
+```
+
+`clean` 依次做：停并禁用相关服务 → 删 systemd unit → 杀残留的 xray/hysteria 进程 →
+清端口跳跃的 iptables 规则 → 删配置/凭据/订阅目录 → 还原 sysctl 与 journald → 复查端口是否真空了。
+
+**只删本脚本创建的东西**，不动系统里其它服务；swap 会保留（不影响重装）。
+
+## 备份与迁移
+
+```bash
+proxy backup                       # → /root/proxy-backup-20261031-160000.tar.gz
+proxy restore /root/xxx.tar.gz     # 在新机器上执行
+```
+
+备份含 `state.env`、`users.txt`、Hysteria2 证书与私钥、`proxy-info.txt`，打包后权限 600。
+
+换 VPS 时 **UUID、x25519 密钥、Hysteria2 密码、证书全部沿用**，客户端只需要把服务器地址改成新 IP
+（或重新导入订阅），协议参数不用重配。`restore` 会自动重新探测公网 IP 并重生成链接——
+IP 变了旧链接本来就连不上，但凭据本身不变。
 
 ---
 
@@ -124,8 +168,10 @@ proxy audit --dnsbl    # 额外查反垃圾库（会把 IP 提交给 Spamhaus）
 | `HY2_INSECURE` | `0` | `1` 关闭证书固定、退回 `insecure`，**仅调试用** |
 | `SUB_HTTP` | `0` | `1` 起一个订阅 HTTP 服务 |
 | `SUB_PORT` | 随机 | 订阅 HTTP 端口 |
+| `SUB_BIND` | `127.0.0.1` | 订阅服务监听地址；改成 `0.0.0.0` 才会对公网开放 |
 | `NODE_NAME` | `Node` | 节点名（订阅与链接里的显示名） |
 | `XRAY_VERSION` | `26.3.27` | Xray 版本，**不建议改动**，见下文 |
+| `CLEAN` | `0` | `1` 安装前先彻底清理旧实例 |
 | `ASSUME_YES` | `0` | `1` 全程不询问 |
 
 示例：
@@ -153,8 +199,17 @@ singbox.json   sing-box
 client-guide.md 客户端配置指南（证书固定 / TUN 参数 / 排障）
 ```
 
-加 `SUB_HTTP=1` 会起一个静态 HTTP 服务提供订阅链接。目录里放了 `index.html`
-遮住目录列表，必须知道完整 token 路径才能取到文件。不需要时：
+加 `SUB_HTTP=1` 会起一个静态 HTTP 服务提供订阅链接。默认**只监听 `127.0.0.1`**，
+手机/电脑取订阅先建 SSH 隧道：
+
+```bash
+ssh -N -L <端口>:127.0.0.1:<端口> root@<服务器IP>
+# 然后访问 http://127.0.0.1:<端口>/<token>/clash.yaml
+```
+
+想让客户端直接拉公网地址就设 `SUB_BIND=0.0.0.0`。但那样 token 就是唯一凭据，
+而且走的是明文 HTTP，只建议在受控网络里用。目录里放了 `index.html` 遮住目录列表，
+必须知道完整 token 路径才能取到文件。不需要时：
 
 ```bash
 systemctl disable --now proxy-sub
@@ -334,10 +389,12 @@ Windows 上 v2rayN 的 TUN 由 sing-box 内核实现，还需要 `bin\sing_box\w
 ## 卸载
 
 ```bash
-proxy uninstall
+proxy clean          # 清服务与配置，保留 proxy 命令方便重装
+proxy clean --all    # 连管理命令和脚本一起删
 ```
 
-会停止并删除服务、配置、订阅目录与状态文件。BBR 与 swap 属于系统级设置，不会还原。
+会停止并删除服务、配置、凭据、订阅目录、状态文件，并还原 sysctl 与 journald 设置。
+swap 文件会保留——它不影响重装，删了反而下次还得重建。
 
 ---
 
