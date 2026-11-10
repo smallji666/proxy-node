@@ -1,0 +1,15 @@
+# 本地与编辑器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 绝对不要提交任何节点信息 / 部署产物
+*.env
+state.env
+proxy-info.txt
+*.pem
+*.key
+*config.json
+*config.yaml

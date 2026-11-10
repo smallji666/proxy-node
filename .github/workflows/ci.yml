@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 语法 / 回归 / 版本一致性 / 去敏
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 行尾必须是 LF
+        shell: bash
+        run: |
+          # Windows 上误提交 CRLF 会让 curl | bash 直接报 "\r: command not found"。
+          bad=$(grep -rlU $'\r' --exclude-dir=.git \
+                 --include='*.sh' --include='*.md' --include='*.yml' \
+                 --include='*.yaml' --include='*.html' . 2>/dev/null || true)
+          if [ -n "$bad" ]; then
+            echo "以下文件含 CRLF, Linux 上脚本会直接跑不起来:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 全部 LF"
+
+      - name: 语法与版本子命令
+        shell: bash
+        run: |
+          bash -n setup.sh
+          bash -n test/run.sh
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh | head -1)
+          epoch=$(sed -n 's/^SCRIPT_EPOCH="\([^"]*\)".*/\1/p' setup.sh | head -1)
+          bdate=$(sed -n 's/^BUILD_DATE="\([^"]*\)".*/\1/p' setup.sh | head -1)
+          [ -n "$ver" ] && [ -n "$epoch" ] && [ -n "$bdate" ] || { echo "版本字段缺失"; exit 1; }
+          out=$(bash setup.sh version)
+          [ "$out" = "proxy-node v${ver} (${bdate})" ] || {
+            echo "version 输出 [$out] 与版本字段不一致"; exit 1; }
+          echo "OK: v${ver} epoch=${epoch} (${bdate})"
+
+      - name: 文档 / 命令生成器版本对齐
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh | head -1)
+          grep -q "Proxy Node Installer v${ver}" README.md || { echo "README 向导标题没对齐"; exit 1; }
+          grep -q "class=\"badge\">v${ver}" docs/index.html || { echo "docs badge 没对齐"; exit 1; }
+          grep -q 'mktemp /tmp/pn.XXXXXXXXXX' README.md || { echo "README 一键命令没用随机临时文件"; exit 1; }
+          grep -q 'mktemp /tmp/pn.XXXXXXXXXX' docs/index.html || { echo "docs 命令生成器没用随机临时文件"; exit 1; }
+          echo "OK: README / docs 对齐 v${ver}"
+
+      - name: tag 与脚本版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh | head -1)
+          [ "$GITHUB_REF_NAME" = "v${ver}" ] || {
+            echo "tag ${GITHUB_REF_NAME} != v${ver}"; exit 1; }
+          echo "OK: tag ${GITHUB_REF_NAME} == v${ver}"
+
+      - name: 回归套件
+        shell: bash
+        run: bash test/run.sh
+
+      - name: 敏感信息扫描
+        shell: bash
+        run: |
+          hits=$(grep -rnE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY' \
+                 --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$hits" ]; then echo "疑似硬编码凭据:"; echo "$hits"; exit 1; fi
+          urls=$(grep -rnE 'https://[^/[:space:]]*@github\.com' --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$urls" ]; then echo "发现内嵌凭据的 URL:"; echo "$urls"; exit 1; fi
+          echo "OK: 无硬编码凭据 / 内嵌凭据 URL"
+
+      - name: 空白错误
+        shell: bash
+        run: |
+          git diff --check
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            git diff --check HEAD~1 HEAD
+          fi
+          echo "OK: 无空白错误"
+
+      - name: shellcheck (参考项, 不计入闸门)
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning setup.sh test/run.sh || \
+            echo "shellcheck 有提示, 仅供参考 —— 硬闸门是上面的回归套件"
