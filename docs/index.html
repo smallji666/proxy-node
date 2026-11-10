@@ -151,7 +151,7 @@ footer .sep{color:var(--line2)}
       <p class="sub">5 种协议自由组合 · 点选参数，生成一条可粘贴到 SSH 的命令</p>
       <p class="sub" style="margin-top:6px;opacity:.75">懒得点选？直接运行 <code style="color:#2dd4bf">bash setup-proxy.sh</code> 会出部署向导，按序号选协议即可</p>
     </div>
-    <span class="badge">v1.0.0</span>
+    <span class="badge">v1.0.1</span>
   </div>
 </header>
 
@@ -208,7 +208,7 @@ footer .sep{color:var(--line2)}
       <div class="field">
         <div class="lab">
           <div class="t">TUIC v5</div>
-          <div class="d">TCP+UDP · UDP 系，BBR 拥塞控制</div>
+          <div class="d">UDP · QUIC over UDP，BBR 拥塞控制</div>
         </div>
         <div class="ctl row">
           <input id="tuicPort" type="number" class="w-90" value="8443" min="1" max="65535">
@@ -375,7 +375,30 @@ footer .sep{color:var(--line2)}
   function on(){ return FIELDS.filter(function(f){ return el(f.id).checked; }); }
   function names(){ return on().map(function(f){ return f.name; }); }
   function val(id){ return el(id).value.trim(); }
-  function q(v){ return /[\s'"$`\\]/.test(v) ? "'" + v.replace(/'/g, "'\\''") + "'" : v; }
+  // 生成的命令要粘到 root shell 里执行。以前 q() 只在值里出现空白 / 引号 /
+  // $ / 反引号时才加单引号, 漏了 ; & | > < ( ) 等元字符 —— 在 "UDP 端口跳跃"
+  // 里填 20000-30000;id 就能让 root 多跑一条命令。
+  // 现在两条硬规则: (1) 所有输入值先过字符集白名单;
+  //                (2) 拼进命令的值一律无条件单引号包裹并转义内部单引号。
+  var ISSUES = [];
+  function issue(name){ if(ISSUES.indexOf(name) < 0) ISSUES.push(name); }
+  function q(v){ return "'" + String(v == null ? "" : v).replace(/'/g, "'\\''") + "'"; }
+  function safePort(v, label){
+    var s = String(v == null ? "" : v).trim();
+    if(!s) return "";
+    if(!/^\d{1,5}$/.test(s) || +s < 1 || +s > 65535){ issue(label); return ""; }
+    return s;
+  }
+  function safeText(v, re, label){
+    var s = String(v == null ? "" : v).trim();
+    if(!s) return "";
+    if(!re.test(s)){ issue(label); return ""; }
+    return s;
+  }
+  var RE_DOMAIN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
+  var RE_HOP    = /^\d{1,5}-\d{1,5}$/;
+  var RE_NAME   = /^[^'"$`\\;&|<>(){}\[\]\r\n\t]+$/;
+  var RE_ADDR   = /^(?:127\.0\.0\.1|0\.0\.0\.0|::1|localhost)$/;
   function badPort(v){ return !!v && (!/^\d+$/.test(v) || +v < 1 || +v > 65535); }
 
   function seg(id, key, after){
@@ -413,24 +436,33 @@ footer .sep{color:var(--line2)}
   el("subBind").addEventListener("change", render);
 
   function build(){
+    ISSUES = [];
     var env = [];
     var ns = names();
-    if(ns.length && ns.join(",") !== "reality,hy2") env.push("PROTOCOLS=" + ns.join(","));
+    if(ns.length && ns.join(",") !== "reality,hy2") env.push("PROTOCOLS=" + q(ns.join(",")));
 
     on().forEach(function(f){
-      var v = val(f.port);
-      if(v && v !== f.def) env.push(PORT_ENV[f.name] + "=" + v);
+      var v = safePort(val(f.port), f.name + " 端口");
+      if(v && v !== f.def) env.push(PORT_ENV[f.name] + "=" + q(v));
     });
 
-    if(state.dest === "custom" && val("destCustom")) env.push("REALITY_DEST=" + q(val("destCustom")));
-    if(el("obfs").checked) env.push("ENABLE_OBFS=1");
-    if(val("hop")) env.push("HY2_HOP=" + val("hop"));
-    if(el("subHttp").checked){
-      env.push("SUB_HTTP=1");
-      if(val("subPort")) env.push("SUB_PORT=" + val("subPort"));
-      if(el("subBind").value !== "127.0.0.1") env.push("SUB_BIND=" + el("subBind").value);
+    if(state.dest === "custom"){
+      var d = safeText(val("destCustom"), RE_DOMAIN, "伪装目标域名");
+      if(d) env.push("REALITY_DEST=" + q(d));
     }
-    var nm = val("nodeName");
+    if(el("obfs").checked) env.push("ENABLE_OBFS=" + q("1"));
+    var hop = safeText(val("hop"), RE_HOP, "UDP 端口跳跃区间");
+    if(hop) env.push("HY2_HOP=" + q(hop));
+    if(el("subHttp").checked){
+      env.push("SUB_HTTP=" + q("1"));
+      var sp = safePort(val("subPort"), "订阅端口");
+      if(sp) env.push("SUB_PORT=" + q(sp));
+      if(el("subBind").value !== "127.0.0.1"){
+        var sb = safeText(el("subBind").value, RE_ADDR, "监听地址");
+        if(sb) env.push("SUB_BIND=" + q(sb));
+      }
+    }
+    var nm = safeText(val("nodeName"), RE_NAME, "节点名");
     if(nm && nm !== "Node") env.push("NODE_NAME=" + q(nm));
 
     var sub = state.mode === "clean" ? "install --clean" : "install";
@@ -445,7 +477,10 @@ footer .sep{color:var(--line2)}
            prefix + "bash /root/setup-proxy.sh " + sub;
   }
 
-  function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  function esc(s){
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+                    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+  }
   function highlight(cmd){
     return esc(cmd).replace(/([A-Z][A-Z0-9_]*)=('[^']*'|[^\s]+)/g, '<span class="k">$1=$2</span>');
   }
@@ -463,12 +498,14 @@ footer .sep{color:var(--line2)}
   }
 
   function render(){
-    el("cmd").innerHTML = highlight(build());
+    var cmd = build();
+    el("cmd").innerHTML = highlight(cmd);
     var msg = summary();
-    var bad = on().some(function(f){ return badPort(val(f.port)); }) || badPort(val("subPort"));
     if(!names().length){
       msg = '<span style="color:#f87171">至少勾选一个协议</span> · ' + msg;
-    } else if(bad){
+    } else if(ISSUES.length){
+      msg = '<span style="color:#f87171">参数不合法，已忽略：' + esc(ISSUES.join("、")) + '</span> · ' + msg;
+    } else if(on().some(function(f){ return badPort(val(f.port)); }) || badPort(val("subPort"))){
       msg = '<span style="color:#f87171">端口需在 1-65535 之间</span> · ' + msg;
     }
     el("sum").innerHTML = msg;
@@ -476,6 +513,13 @@ footer .sep{color:var(--line2)}
 
   el("copyBtn").addEventListener("click", function(){
     var btn = this, text = build();
+    // ISSUES 非空说明有输入框没过白名单。值已经被丢弃, 但别让用户在没注意
+    // 红色提示的情况下把一条"少了几项参数"的命令粘去 VPS。
+    if(ISSUES.length){
+      btn.textContent = "参数不合法";
+      setTimeout(function(){ btn.textContent = "复制命令"; }, 1400);
+      return;
+    }
     var done = function(){
       var old = btn.textContent;
       btn.textContent = "已复制";

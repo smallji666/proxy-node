@@ -25,9 +25,14 @@ jobs:
         shell: bash
         run: |
           # Windows 上误提交 CRLF 会让 curl | bash 直接报 "\r: command not found"。
-          bad=$(grep -rlU $'\r' --exclude-dir=.git \
-                 --include='*.sh' --include='*.md' --include='*.yml' \
-                 --include='*.yaml' --include='*.html' . 2>/dev/null || true)
+          # 别用 --include 白名单: LICENSE / .gitattributes / .gitignore 这些无后缀
+          # 文件会漏在外面, 而它们的 CRLF 一样会让 Linux 上的脚本出问题。
+          # -I 跳过二进制; 本仓库全是文本。
+          # 不用 $'\r': 某些 shell(实测 MSYS bash)会把它展开成空串, 空模式会
+          # 匹配所有文件, 闸门变成假红。用 printf 构造并自检长度。
+          cr=$(printf '\r')
+          [ "$(printf '%s' "$cr" | wc -c)" -eq 1 ] || { echo "CR 字节构造失败"; exit 1; }
+          bad=$(grep -rlIU "$cr" --exclude-dir=.git . 2>/dev/null || true)
           if [ -n "$bad" ]; then
             echo "以下文件含 CRLF, Linux 上脚本会直接跑不起来:"
             echo "$bad"
@@ -59,8 +64,9 @@ jobs:
           grep -q 'mktemp /tmp/pn.XXXXXXXXXX' docs/index.html || { echo "docs 命令生成器没用随机临时文件"; exit 1; }
           echo "OK: README / docs 对齐 v${ver}"
 
+      # 用 ref_type 而不是前缀 refs/tags/v: 纯数字 tag(1.0.1) 以前会静默跳过校验。
       - name: tag 与脚本版本一致
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh | head -1)
@@ -80,7 +86,14 @@ jobs:
           if [ -n "$hits" ]; then echo "疑似硬编码凭据:"; echo "$hits"; exit 1; fi
           urls=$(grep -rnE 'https://[^/[:space:]]*@github\.com' --exclude-dir=.git . 2>/dev/null || true)
           if [ -n "$urls" ]; then echo "发现内嵌凭据的 URL:"; echo "$urls"; exit 1; fi
-          echo "OK: 无硬编码凭据 / 内嵌凭据 URL"
+          # 本项目自己生成的凭据: 源码里的 UUID="" 是空赋值, 只匹配单引号包住的
+          # 非空字面量, 避免把正常代码判成泄密。
+          own=$(grep -rnE "(UUID|PRIV|PUB|SID|HY2_PASS|OBFS_PASS|SS2022_PASS|ANYTLS_PASS|TUIC_PASS|TUIC_UUID|SUB_TOKEN|SB_PIN|SB_HEX)='[^']{8,}'" \
+                 --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$own" ]; then echo "疑似真实的部署凭据被提交:"; echo "$own"; exit 1; fi
+          artifacts=$(git ls-files | grep -E '(^|/)(state\.env|sub\.env|users\.txt|proxy-info\.txt|proxy-backup-[^/]*|[^/]*\.tar\.gz|proxy-diag-[^/]*\.txt)$' || true)
+          if [ -n "$artifacts" ]; then echo "部署产物不应提交:"; echo "$artifacts"; exit 1; fi
+          echo "OK: 无硬编码凭据 / 内嵌凭据 URL / 部署产物"
 
       - name: 空白错误
         shell: bash
@@ -89,7 +102,17 @@ jobs:
           if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
             git diff --check HEAD~1 HEAD
           fi
-          echo "OK: 无空白错误"
+          # 单根提交仓库里上面两条恒为空(干净 checkout 没有 diff), 闸门等于没有。
+          # 直接扫整棵已跟踪的树; Markdown 结尾双空格是有意的换行语法, 排除掉。
+          bad=$(git grep -nIE '[[:blank:]]+$' -- . ':(exclude)*.md' 2>/dev/null || true)
+          if [ -n "$bad" ]; then
+            echo "以下文件有行尾空白:"; echo "$bad"; exit 1
+          fi
+          conflicts=$(git grep -nE '^(<<<<<<<|>>>>>>>)' -- . 2>/dev/null || true)
+          if [ -n "$conflicts" ]; then
+            echo "发现未解决的冲突标记:"; echo "$conflicts"; exit 1
+          fi
+          echo "OK: 无空白错误 / 冲突标记"
 
       - name: shellcheck (参考项, 不计入闸门)
         continue-on-error: true

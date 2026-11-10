@@ -83,7 +83,7 @@ PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL https://raw.githubusercontent.
 
 ```
 ============================================================
-   Proxy Node Installer v1.0.0   ·   部署向导
+   Proxy Node Installer v1.0.1   ·   部署向导
 ============================================================
 
   当前状态: 尚未安装
@@ -180,7 +180,7 @@ proxy upgrade 26.3.27  # 装指定版本（同样做完整性校验）；--rollb
 >    发现更新就下载、`bash -n` 校验、原子替换自己，然后 `exec` 新版继续部署。
 >    下载失败或校验不过就退回当前版本继续，不会卡住
 >
-> 三条校验（语法能过 / 有版本号 / 内容确实是这份脚本）任何一条不过就丢弃下载结果，
+> 校验（语法能过 / 有版本号 / 内容确实是这份脚本 / 多源哈希一致）任何一条不过就丢弃下载结果，
 > 磁盘上那份永远不会被写坏。装完还会顺手清掉其它位置的旧副本。
 >
 > 已安装的机器敲 `proxy` 打开菜单**不会**卡在网络上查版本——只有真的要部署时才查。
@@ -497,7 +497,7 @@ PROTOCOLS=ss2022 bash /root/setup-proxy.sh install        # 只装一个也可�
 | `hy2` | hysteria | UDP 443 | 备用。UDP 抗丢包，弱网、跨境视频更稳 |
 | `ss2022` | sing-box | TCP+UDP 8445 | 兼容兜底。老客户端、路由器、IoT 设备基本都认 |
 | `anytls` | sing-box | TCP 8444 | 新协议。TLS 内多路复用，流量特征接近普通 HTTPS |
-| `tuic` | sing-box | TCP+UDP 8443 | UDP 系，BBR 拥塞控制，晚高峰表现好 |
+| `tuic` | sing-box | UDP 8443 | QUIC over UDP，BBR 拥塞控制，晚高峰表现好 |
 
 后三个由同一个 sing-box 进程承载，装几个都只占一个进程。
 
@@ -530,7 +530,7 @@ SS2022_PORT=9445 ANYTLS_PORT=9444 TUIC_PORT=9443 bash /root/setup-proxy.sh insta
 | `VLESS_PORT` | `443` | VLESS 监听 TCP 端口 |
 | `SS2022_PORT` | `8445` | Shadowsocks-2022 端口（TCP+UDP） |
 | `ANYTLS_PORT` | `8444` | AnyTLS 端口（TCP） |
-| `TUIC_PORT` | `8443` | TUIC v5 端口（TCP+UDP） |
+| `TUIC_PORT` | `8443` | TUIC v5 端口（仅 UDP） |
 | `HY2_PORT` | `443` | Hysteria2 监听 UDP 端口（可与 TCP 443 共存） |
 | `REALITY_DEST` | 自动 | 伪装目标站，留空则自动挑选并验证；填 `random` 强制重新随机挑一个 |
 | `ENABLE_OBFS` | `0` | `1` 开启 Hysteria2 salamander 混淆 |
@@ -683,7 +683,7 @@ ssh -N -L <端口>:127.0.0.1:<端口> root@<服务器IP>
 **订阅服务只响应 `/<token>/<已知文件名>`，其余一律 404，不列目录。**
 这一点很关键：早前用的是 `python3 -m http.server`，它会在根路径返回目录列表，
 而目录名就是 token —— 任何人扫到这个端口，`GET /` 一次就能拿到全部凭据。
-现在换成自带的 40 行小服务（`/usr/local/lib/proxy-sub/server.py`），
+现在换成自带的 65 行小服务（`/usr/local/lib/proxy-sub/server.py`），
 带文件名白名单和目录穿越防护。不需要时：
 
 ```bash
@@ -1339,12 +1339,12 @@ PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) \
 ```
 
 国内 VPS 拉不动 `raw.githubusercontent.com` 时，给 URL 加 `https://ghfast.top/` 前缀。
-覆盖完 `proxy version` 应显示 `v1.0.0`；之后 `proxy update` 就走世代判断了。
+覆盖完 `proxy version` 应显示 `v1.0.1`；之后 `proxy update` 就走世代判断了。
 想连磁盘上的脚本一起删掉再重装：`proxy clean --all`（本版也会清掉改名过的副本）。
 
 **Q: 同一条命令，为什么每次在 VPS 里看到的选项不一样**
 
-界面顶部现在会印两行：标题里的版本号（当前 `v1.0.0`），和下面那行 `脚本 /root/setup-proxy.sh`。
+界面顶部现在会印两行：标题里的版本号（当前 `v1.0.1`），和下面那行 `脚本 /root/setup-proxy.sh`。
 先对这两样，基本就能定位：
 
 | 现象 | 原因 |
@@ -1481,6 +1481,30 @@ swap 文件会保留——它不影响重装，删了反而下次还得重建。
 ---
 
 ## 版本记录
+
+**v1.0.1（2026-11-11，世代 5）** —— 逐文件复查后的二次加固，不含新功能：
+
+- **P1**：`proxy reset` 先整份备份状态目录，中途任何一步失败都由 `EXIT` trap 自动
+  回滚，不会留下「凭据已清空、服务还跑着旧配置」的半成品；环境变量里填了非法端口
+  不再被清成空串（会写出 `"port": ,` 这种坏 JSON），一律回退到该服务的默认端口；
+  在线命令生成器里所有输入值先过字符集白名单、再无条件单引号包裹 —— 以前在
+  `UDP 端口跳跃` 里粘进 `20000-30000;...` 会在 root shell 里被断句执行。
+- **P1/P2**：`proxy diag <路径>` 只允许写 `/root/` 或 `/tmp/` 下的普通文件名，
+  拒绝 `..` 与符号链接；`proxy restore` 把公网 IP 探测提前到覆盖状态之前；
+  备份包排除自身目录避免嵌套；`proxy verify --fix` 不再吞掉 `chmod` 失败后仍报
+  「自检通过」。
+- **P2**：凭据读入后统一卡死字符集（引号 / 空格 / 分号等一律丢弃重生成）；已装过的
+  hysteria 也复验内置 SHA-256；`SUB_HTTP=1` 且非本机监听时补放行订阅端口并在完成
+  提示里写明；`DEFAULT_NODE=hy2` 时 DNS 的 `detour` 跟着切到 HY2；swap 只有整条
+  链路成功才写 `/etc/fstab`；`valid_bind` 拒绝伪 IPv6；端口占用检测不再被
+  `pipefail` + `grep -q` 的 SIGPIPE 误判。
+- **P3**：`proxy clean` 补清日志、诊断报告与重置备份；向导改用 `read -ra` 避免 glob
+  展开；维护项与协议选择冲突时给出告警；菜单「重新部署」补查远端版本；`clean` /
+  `update` 的参数完整透传；TUIC 文档改为 UDP-only；订阅服务行数写实。
+- 工程化：回归套件补齐上述行为断言（含用 Node 真跑一遍命令生成器），CI 的行尾 /
+  空白 / 去敏闸门不再恒真，`.gitignore` 补上备份与诊断产物。
+
+---
 
 **v1.0.0（2026-11-10，世代 4）** —— 全量复查后的缺陷修复，不含新功能：
 

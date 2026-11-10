@@ -52,12 +52,12 @@ umask 077
 APP_NAME="proxy"
 # 版本号必须和 tag 对得上 —— proxy update 靠它判断"本地是不是旧的"。
 # 改代码就顺手改这里, 否则自更新会认为已经是最新。
-SCRIPT_VERSION="1.0.0"
-BUILD_DATE="2026-11-10"
+SCRIPT_VERSION="1.0.1"
+BUILD_DATE="2026-11-11"
 # 世代: 只增不减, 与 x.y.z 无关。版本号可能重新起算(例如 1.3.x -> 1.0.0),
 # 只比版本号会把磁盘上的旧代码判成"更新"并拒绝升级 —— 这个数就是那条判据的兜底。
 # 更早的脚本没有这一行, 一律按世代 0 处理。
-SCRIPT_EPOCH="4"
+SCRIPT_EPOCH="5"
 STATE_DIR="/etc/proxy-node"
 STATE_FILE="${STATE_DIR}/state.env"
 USERS_FILE="${STATE_DIR}/users.txt"
@@ -325,6 +325,46 @@ safe_state_scalars(){
   return 0
 }
 
+# 凭据会直接插进 Clash YAML / sing-box JSON / 分享链接 / systemd unit。
+# 只清控制字符不够: 手改过的 state.env 或旧备份里带引号、空格、分号的值
+# 会写坏配置甚至拼出额外参数。统一在读入后卡死字符集, 非法就丢弃重生成。
+CRED_KEYS="HY2_PASS OBFS_PASS SS2022_PASS ANYTLS_PASS TUIC_PASS TUIC_UUID SB_PIN SB_HEX HY2_PIN CERT_SPKI_B64 CERT_DER_B64 CERT_HEX SUB_TOKEN"
+safe_cred_scalars(){
+  local k v
+  for k in $CRED_KEYS; do
+    v="${!k-}"
+    [ -n "$v" ] || continue
+    case "$v" in
+      *[!A-Za-z0-9_=+/-]*)
+        warn "凭据 ${k} 含不允许的字符(可能来自手改的 state.env), 已丢弃并重新生成"
+        printf -v "$k" '%s' "" ;;
+    esac
+  done
+  # EGRESS_URL 是 socks5:// URL, 用宽一点的白名单, 但绝不留 shell 元字符/引号/空格。
+  # 正则放进变量: 字符类里的 & 直接写在 case 模式里会被 bash 当成控制符,
+  # 整份脚本直接语法错。
+  local _egress_ere='[^A-Za-z0-9_.:/?@=&%+-]'
+  if [ -n "${EGRESS_URL:-}" ] && [[ "$EGRESS_URL" =~ $_egress_ere ]]; then
+    warn "EGRESS_URL 含非法字符(空格/引号/shell 元字符), 已忽略"
+    EGRESS_URL=""
+  fi
+  return 0
+}
+
+# 非法端口一律回退到该服务的默认值, 绝不能清空 —— 空值会被 validate_ports
+# 的 [ -n ] 短路放行, 最后写出 "port": , 这种非法 JSON。单独成函数便于回归测试。
+port_default(){
+  case "${1:-}" in
+    VLESS_PORT)  echo 443 ;;
+    HY2_PORT)    echo 443 ;;
+    SS2022_PORT) echo 8445 ;;
+    ANYTLS_PORT) echo 8444 ;;
+    TUIC_PORT)   echo 8443 ;;
+    SUB_PORT)    echo "" ;;
+    *)           echo "" ;;
+  esac
+}
+
 # 监听地址会拼进 systemd 的 ExecStart 参数, 只允许地址字面量。
 valid_bind(){
   local b="${1:-}" o
@@ -333,7 +373,12 @@ valid_bind(){
   case "$b" in *[!A-Za-z0-9.:]*) return 1 ;; esac
   case "$b" in 127.0.0.1|0.0.0.0|::|::1|localhost) return 0 ;; esac
   case "$b" in
-    *:*) case "$b" in *[!0-9A-Fa-f:]*) return 1 ;; *) return 0 ;; esac ;;
+    *:*) case "$b" in *[!0-9A-Fa-f:]*|*:::*) return 1 ;; esac
+         # 只验字符集会放过 :::: 或 9 组地址。冒号数 2-7 对应合法组数范围,
+         # 连续三个冒号已在上面拒绝。
+         local _col="${b//[^:]/}"
+         [ "${#_col}" -ge 2 ] && [ "${#_col}" -le 7 ] || return 1
+         return 0 ;;
   esac
   # IPv4 字面量: 必须四段, 每段 0-255 (光靠正则会放过 999.1.1.1)
   local IFS=.
@@ -365,6 +410,7 @@ load_state(){
   done < "$STATE_FILE"
   [ "$found" = "1" ] || return 1
   safe_state_scalars
+  safe_cred_scalars
   # 老版本写进 state.env 的备注名可能带引号/反斜杠, 读回来必须再过一遍,
   # 否则 clash.yaml 里那行 name: "..." 会直接把整份 YAML 写坏
   NODE_NAME=$(sanitize_node_name "${NODE_NAME:-Node}")
@@ -446,14 +492,20 @@ update_state_kv(){
   # 之前正是这样把带引号的值写成了可执行的一行。
   newline="${k}=$(sh_quote "$v")"
   tmp=$(mktemp "$(dirname "$f")/.state.XXXXXXXX" 2>/dev/null) || return 1
-  while IFS= read -r ln || [ -n "$ln" ]; do
-    case "$ln" in
-      "${k}="*) printf '%s\n' "$newline" >> "$tmp"; found=1 ;;
-      *) printf '%s\n' "$ln" >> "$tmp" ;;
-    esac
-  done < "$f"
-  [ "$found" = "1" ] || printf '%s\n' "$newline" >> "$tmp"
-  chmod 600 "$tmp" 2>/dev/null || true
+  # 整份重定向并接住返回码。逐行 >> 不查错的话, 磁盘满 / 目录只读时截断的
+  # 临时文件会被 mv 成 state.env, 等于把 UUID 与私钥弄丢一半。
+  if ! {
+    while IFS= read -r ln || [ -n "$ln" ]; do
+      case "$ln" in
+        "${k}="*) printf '%s\n' "$newline"; found=1 ;;
+        *) printf '%s\n' "$ln" ;;
+      esac
+    done < "$f"
+    [ "$found" = "1" ] || printf '%s\n' "$newline"
+  } > "$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
   return 0
 }
@@ -507,12 +559,19 @@ apply_env_overrides(){
   fi
   # 端口在 validate_ports 里还会再查一次并去掉前导零; 这里先拦住明显不是
   # 数字的值, 免得它们先被写进 state.env / 订阅链接 / JSON。
+  # 非法值必须回退默认值: 以前是清空, 结果 validate_ports 因为 [ -n ] 直接
+  # 放行空值, 最后写出 "port": , 这种 xray/sing-box 都解析不了的 JSON。
   for _k in VLESS_PORT HY2_PORT SS2022_PORT ANYTLS_PORT TUIC_PORT SUB_PORT; do
     _v="${!_k-}"
     [ -n "$_v" ] || continue
-    valid_port "$_v" || { warn "${_k}='${_v}' 不是合法端口, 已忽略"; printf -v "$_k" '%s' ""; }
+    if ! valid_port "$_v"; then
+      _d=$(port_default "$_k")
+      warn "${_k}='${_v}' 不是合法端口, 已改用默认值 ${_d:-随机}"
+      printf -v "$_k" '%s' "$_d"
+    fi
   done
   safe_state_scalars
+  safe_cred_scalars
   return 0
 }
 
@@ -557,14 +616,27 @@ install_deps(){
 }
 
 get_server_ip(){
-  local ip=""
+  local ip="" o
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
        | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
   if [ -z "$ip" ] || echo "$ip" | grep -qE '^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
     ip=$(curl -s4 --max-time 10 https://api.ipify.org 2>/dev/null \
       || curl -s4 --max-time 10 https://ifconfig.me 2>/dev/null || echo "")
   fi
-  echo "$ip" | tr -d '[:space:]'
+  # 以前只做 tr -d '[:space:]': captive portal / 错误页 / 超时残留会被压成
+  # 一长串文本写进 SERVER_IP, 订阅与分享链接全指向垃圾地址。必须是合法 IPv4。
+  ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+  case "$ip" in
+    ''|*[!0-9.]*) ip="" ;;
+    *) local IFS=.
+       set -- $ip
+       [ "$#" -eq 4 ] || ip=""
+       for o in "$@"; do
+         case "$o" in ''|*[!0-9]*) ip=""; break ;; esac
+         [ "$o" -le 255 ] || { ip=""; break; }
+       done ;;
+  esac
+  printf '%s' "$ip"
 }
 
 # 端口参数必须是 1-65535 的整数。写错的话 xray / sing-box 只会回一句
@@ -602,9 +674,13 @@ validate_ports(){
 }
 
 port_in_use(){
-  local proto="${2:-tcp}" flag="-tln"
+  local proto="${2:-tcp}" flag="-tln" out
   [ "$proto" = "udp" ] && flag="-uln"
-  ss "$flag" 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"
+  # pipefail 下 grep -q 命中就退出, ss/awk 会吃 SIGPIPE 令整条管道判失败,
+  # 结果是"端口明明被占用却查成没占用"。ensure_xray 那段注释里踩过同一个坑。
+  # awk 不提前 exit, 读完整个输入, ss 才不会收到 SIGPIPE。
+  out=$(ss "$flag" 2>/dev/null | awk -v p="${1}" '$4 ~ "[:.]" p "$" {print "1"}') || return 1
+  [ -n "$out" ]
 }
 
 # 占用端口的进程, 输出 "名字(pid)"; 查不到返回空
@@ -1498,8 +1574,14 @@ ensure_hy2(){
     *) die "不支持的架构: $arch" ;;
   esac
 
-  if [ -x "$HY2_BIN" ]; then
-    ok "Hysteria2 已安装, 跳过"
+  # 已装也要复验基准哈希: 内置 SHA-256 不能只在下载路径生效。xray 分支至少
+  # 会比对版本, 这里以前连版本都不看, 被替换/降级的二进制会一直留着。
+  local _hy2_ok=0
+  if [ -x "$HY2_BIN" ] && [ -n "${HY2_BIN_SHA:-}" ]; then
+    [ "$(file_sha256 "$HY2_BIN" 2>/dev/null)" = "$HY2_BIN_SHA" ] && _hy2_ok=1
+  fi
+  if [ "$_hy2_ok" = "1" ]; then
+    ok "Hysteria2 已安装且哈希一致, 跳过"
   else
     info "下载 Hysteria2 v${HY2_VERSION} ..."
     # 固定版本而不是 latest: 否则每次重装内核都可能换版本, 行为不可复现,
@@ -2218,10 +2300,20 @@ JOURNAL
     ;;&
   all|swap)
     if [ "$(free -m | awk '/Swap:/{print $2}')" = "0" ] && [ ! -f /swapfile ]; then
-      fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null
-      chmod 600 /swapfile && mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile >/dev/null 2>&1
-      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      ok "已添加 1GB swap"
+      # 整条链必须一起判成功。容器/老内核/磁盘不足时 fallocate+mkswap+swapon
+      # 常常失败, 旧版却无条件写 fstab 并打印 ok —— 残留无效条目会让开机
+      # swapon -a 失败, 还谎报"已添加"。
+      if { fallocate -l 1G /swapfile 2>/dev/null \
+           || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null; } \
+         && chmod 600 /swapfile \
+         && mkswap /swapfile >/dev/null 2>&1 \
+         && swapon /swapfile >/dev/null 2>&1; then
+        grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        ok "已添加 1GB swap"
+      else
+        rm -f /swapfile 2>/dev/null || true
+        warn "swap 创建失败(容器/内核不支持或磁盘不足), 已跳过; 未改动 /etc/fstab"
+      fi
     else
       ok "swap 已就绪 ($(free -m | awk '/Swap:/{print $2}')MB)"
     fi
@@ -2810,6 +2902,12 @@ setup_firewall(){
   # TUIC v5 是 QUIC, 只跑 UDP。多放行一个 TCP 没有用处, 还会让
   # "8443/tcp 被无关进程占用"变成一次误判甚至误杀。
   proto_on tuic    && ports="${ports} ${TUIC_PORT}/udp"
+  # 订阅 HTTP 对公网开放时, 它自己的 TCP 端口也要放行。以前只管代理协议端口,
+  # SUB_HTTP=1 + SUB_BIND=0.0.0.0 时订阅服务一直被本机防火墙拦着。
+  if [ "${SUB_HTTP:-0}" = "1" ] && [ "${SUB_BIND:-127.0.0.1}" != "127.0.0.1" ] \
+     && [ -n "${SUB_PORT:-}" ] && valid_port "$SUB_PORT"; then
+    ports="${ports} ${SUB_PORT}/tcp"
+  fi
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
   [ -f "$FW_RULES" ] && old=$(cat "$FW_RULES" 2>/dev/null)
 
@@ -2900,7 +2998,7 @@ stop_unused_services(){
         systemctl disable --now "$unit" >/dev/null 2>&1
         stopped="${stopped} ${unit}"
       fi
-      break
+      # 不能 break: 两个 unit 同时存在时, 只检查第一个会漏停旧版 hy2 进程。
     done
   fi
   if ! sb_enabled && [ -f /etc/systemd/system/sing-box.service ]; then
@@ -2958,7 +3056,8 @@ gen_links(){
       # SIP002: base64url(method:password), 去掉 padding
       # 密码是 "服务端密钥:设备密钥", 整段一起 base64, 客户端按第一个冒号切分
       ss_ui=$(printf '2022-blake3-aes-128-gcm:%s' "$(ss_pass_for "$pu")" \
-        | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+        | openssl base64 -A | tr '+/' '-_' | tr -d '=') || die "SS 链接编码失败"
+      [ -n "$ss_ui" ] || die "SS 链接编码结果为空"
       SS_LINK="ss://${ss_ui}@${SERVER_IP}:${SS2022_PORT}#${NODE_NAME}-SS2022"
     fi
     if proto_on anytls; then
@@ -3124,6 +3223,13 @@ JSON
 
   [ ${#ob[@]} -gt 0 ] || die "没有任何可用协议, 检查 PROTOCOLS"
 
+  # 默认出口必须在写 DNS server 之前定下来: dns.remote 的 detour 用的就是它。
+  # 以前改 first_tag 放在 outbounds 那段之后, DEFAULT_NODE=hy2 时流量走 HY2、
+  # DNS 却仍绕 Reality, Reality 一挂 DNS 全断。
+  if [ "$(effective_default_node)" = "hy2" ]; then
+    first_tag="hy2-out"
+  fi
+
   {
     echo "{"
     echo '  "log": { "level": "info" },'
@@ -3151,10 +3257,7 @@ JSON
     echo '  "inbounds": ['
     echo '    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }'
     echo '  ],'
-    # 默认出口与 clash.yaml 的 select 第一项保持一致; 默认仍是 vless-out(TCP)。
-    if [ "$(effective_default_node)" = "hy2" ]; then
-      first_tag="hy2-out"
-    fi
+    # first_tag 已在上面按 effective_default_node 定好, 这里不再改动。
     printf '  "outbounds": [\n%s,\n    { "type": "direct", "tag": "direct", "network_strategy": "default" }\n  ],\n' \
       "$(printf '%s,\n' "${ob[@]}" | sed '$ s/,$//')"
     # 劫持 DNS 只能用 "port": 53, 不能用 "protocol": "dns" —— 后者在 sing-box 1.12+
@@ -3225,13 +3328,18 @@ gen_sub_files(){
 HTML
     chmod 644 "$SUB_DIR/index.html"
   fi
-  # token 为空会让订阅目录变成 $SUB_DIR 本身, 而 HTTP 服务只认两段路径 ——
-  # 表现是订阅一直 404, 而且很难看出原因。openssl 挂了就用内核熵源兜底。
-  if [ -z "${SUB_TOKEN:-}" ]; then
-    SUB_TOKEN=$(openssl rand -hex 16 2>/dev/null)
-    [ -n "$SUB_TOKEN" ] || SUB_TOKEN=$(head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    [ -n "$SUB_TOKEN" ] || die "无法生成订阅 token (openssl 与 /dev/urandom 都不可用)"
-  fi
+  # token 会直接拼进订阅目录 $SUB_DIR/$SUB_TOKEN。只判空不够: 手改过的
+  # state.env / 旧备份里带 / 或 .. 时, root 下 mkdir -p 会写到目录外,
+  # chmod 755 还会作用到父目录。校验必须在 mkdir 之前, 不能留给后面的
+  # maybe_sub_http(那时文件早就写出去了)。
+  case "${SUB_TOKEN:-}" in
+    ''|*[!A-Za-z0-9_-]*)
+      SUB_TOKEN=$(openssl rand -hex 16 2>/dev/null)
+      [ -n "$SUB_TOKEN" ] || SUB_TOKEN=$(head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+      [ -n "$SUB_TOKEN" ] || die "无法生成订阅 token (openssl 与 /dev/urandom 都不可用)"
+      warn "订阅 token 为空或含非法字符, 已重新生成; 请重新获取订阅链接"
+      ;;
+  esac
   local tdir="${SUB_DIR}/${SUB_TOKEN}"
   mkdir -p "$tdir"; chmod 755 "$tdir"
 
@@ -3827,6 +3935,9 @@ maybe_sub_http(){
     return 0
   fi
   [ -n "${SUB_PORT:-}" ] || SUB_PORT=$(( (RANDOM % 10000) + 30000 ))
+  # SUB_BIND / SUB_TOKEN 都在这里卡过格式, 唯独 SUB_PORT 没有 —— 它会拼进
+  # systemd 的 ExecStart, 带空格就会拆成多个参数, 服务静默起不来。
+  valid_port "$SUB_PORT" || die "SUB_PORT='${SUB_PORT}' 不是合法端口, 请重新执行: ${APP_NAME} sub"
 
   # 不能用 python3 -m http.server: 它会在根路径返回目录列表, 而目录名就是订阅
   # token —— 任何人扫到这个端口, GET / 一次就把全部凭据拿走了。
@@ -4218,8 +4329,21 @@ selftest_sb_proto(){
   sleep 2
   rc=$(curl -s --socks5-hostname 127.0.0.1:20801 -o /dev/null -w '%{http_code}' \
        --max-time 12 http://cp.cloudflare.com/generate_204 2>/dev/null)
-  kill "$pid" >/dev/null 2>&1; wait "$pid" 2>/dev/null
-  grep -qi 'FATAL' "$tmp/log" 2>/dev/null && rc="cfg"
+  kill "$pid" >/dev/null 2>&1
+  # 不能裸 wait: 客户端忽略 TERM 时自检会永久挂起, 20801 端口也被占住,
+  # 下一次自检又会因端口冲突误报"不通"。轮询 + KILL 兜底。
+  local _w=0
+  while kill -0 "$pid" 2>/dev/null && [ "$_w" -lt 20 ]; do
+    sleep 0.2; _w=$((_w + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" >/dev/null 2>&1 || true; fi
+  wait "$pid" 2>/dev/null || true
+  # 已经拿到 200/204 就说明代理是通的, 日志里偶尔出现 FATAL 字样不该把它
+  # 反过来判成"订阅配置非法"。
+  case "$rc" in
+    200|204) ;;
+    *) grep -qi 'FATAL' "$tmp/log" 2>/dev/null && rc="cfg" ;;
+  esac
   rm -rf "$tmp"
   case "$rc" in 200|204) return 0 ;; cfg) return 3 ;; *) return 1 ;; esac
 }
@@ -4664,6 +4788,8 @@ cmd_install(){
   proto_on ss2022  && fw="${fw} TCP+UDP ${SS2022_PORT}"
   proto_on anytls  && fw="${fw} TCP ${ANYTLS_PORT}"
   proto_on tuic    && fw="${fw} UDP ${TUIC_PORT}"
+  if [ "${SUB_HTTP:-0}" = "1" ] && [ "${SUB_BIND:-127.0.0.1}" != "127.0.0.1" ] \
+     && [ -n "${SUB_PORT:-}" ]; then fw="${fw} TCP ${SUB_PORT}(订阅)"; fi
   echo -e "${Y}必做${N}: 云安全组放行${Y}${fw}${N}"
   [ -n "${HY2_HOP:-}" ] && echo -e "        以及 ${Y}UDP ${HY2_HOP}${N} (端口跳跃)"
   echo
@@ -5024,11 +5150,19 @@ cmd_verify(){
   if [ -n "$VERIFY_FIX" ]; then
     if [ "$fix" = "1" ]; then
       echo
+      local _chmod_fail=0
       while IFS='|' read -r a a2; do
-        [ -n "$a" ] && chmod "$a2" "$a" 2>/dev/null && echo -e "  ${G}已修正${N} $a -> $a2"
+        [ -n "$a" ] || continue
+        if chmod "$a2" "$a" 2>/dev/null; then
+          echo -e "  ${G}已修正${N} $a -> $a2"
+        else
+          echo -e "  ${R}修正失败${N} $a -> $a2 (文件只读/属主不符?)"
+          _chmod_fail=1
+        fi
       done <<< "$VERIFY_FIX"
-      # 只清权限这一类问题, 不能把配置/服务/DNS 的失败一起抹掉
-      perm_bad=0
+      # 以前 chmod 失败被 2>/dev/null && 吞掉后仍无条件 perm_bad=0,
+      # 凭据还是 world-readable 却打印"自检通过"。只有全修好才算过。
+      [ "$_chmod_fail" = "0" ] && perm_bad=0
     else
       echo
       echo -e "  ${Y}加 --fix 可自动修正上面的权限问题:${N} proxy verify --fix"
@@ -5083,10 +5217,36 @@ bin_ver(){
   printf '%s' "${v#v}" | grep . || printf '未知'
 }
 
+# 诊断报告路径单独成函数: 这是唯一一段"用户输入直接决定 root 写哪个文件"的判断,
+# 必须能被回归套件直接调用验证, 不能埋在 cmd_diag 里靠肉眼审。
+# 用全局 DIAG_OUT / DIAG_PATH_ERR 传结果, 不走命令替换 —— 子 shell 里改的变量
+# 传不回父进程, 失败原因会丢。
+DIAG_OUT=""
+DIAG_PATH_ERR=""
+diag_out_path(){
+  DIAG_OUT=""; DIAG_PATH_ERR=""
+  local out="${1:-}"
+  if [ -z "$out" ]; then
+    DIAG_OUT="/root/proxy-diag-$(date +%Y%m%d-%H%M%S).txt"
+    return 0
+  fi
+  case "$out" in
+    /root/*|/tmp/*) ;;
+    *) DIAG_PATH_ERR="诊断报告只能写到 /root/ 或 /tmp/ 下: ${out}"; return 1 ;;
+  esac
+  case "$out" in *..*) DIAG_PATH_ERR="诊断报告路径不能含 '..': ${out}"; return 1 ;; esac
+  case "${out##*/}" in ''|.|..|*/*) DIAG_PATH_ERR="诊断报告文件名不合法: ${out}"; return 1 ;; esac
+  [ ! -L "$out" ] || { DIAG_PATH_ERR="诊断报告路径是符号链接, 拒绝写入: ${out}"; return 1; }
+  [ -d "$(dirname "$out")" ] || { DIAG_PATH_ERR="目录不存在: $(dirname "$out")"; return 1; }
+  DIAG_OUT="$out"
+  return 0
+}
+
 cmd_diag(){
   need_root
-  local out="${1:-/root/proxy-diag-$(date +%Y%m%d-%H%M%S).txt}"
-  local raw installed=0 u act en rst found
+  local out raw installed=0 u act en rst found
+  diag_out_path "${1:-}" || die "${DIAG_PATH_ERR}"
+  out="$DIAG_OUT"
   raw=$(mktemp 2>/dev/null) || die "无法创建临时文件"
 
   load_state >/dev/null 2>&1 && installed=1
@@ -5287,9 +5447,15 @@ cmd_diag(){
     [ "$found" = "1" ] || echo "  (无相关单元)"
   } >> "$raw"
 
-  diag_redact < "$raw" > "$out"
-  rm -f "$raw"
-  chmod 600 "$out"
+  # 重定向失败也要接住: 以前照样删掉 raw、照样打印"已生成", 采集结果全丢。
+  if diag_redact < "$raw" > "$out" && chmod 600 "$out"; then
+    rm -f "$raw"
+  else
+    rm -f "$out" 2>/dev/null || true
+    warn "诊断报告写入失败: ${out} (目录不可写?)"
+    warn "原始采集结果保留在 ${raw}, 含未脱敏凭据, 请手动删除"
+    return 1
+  fi
 
   echo
   hr
@@ -5870,7 +6036,10 @@ cmd_backup(){
     die "没有可备份的内容, 先安装: bash setup-proxy.sh install"
   fi
 
-  tar -czf "$out" -C "$tmp" . || { rm -rf "$tmp"; die "打包失败"; }
+  # 排除 $STATE_DIR/backup: 否则每次 backup -> restore -> backup 都会把上一轮
+  # 备份整份塞进新包, 体积逐层膨胀。
+  tar -czf "$out" -C "$tmp" --exclude='./etc-proxy-node/backup' . \
+    || { rm -rf "$tmp"; die "打包失败"; }
   chmod 600 "$out"
   rm -rf "$tmp"
   ok "已备份: ${out}  ($(du -h "$out" 2>/dev/null | awk '{print $1}'))"
@@ -5918,10 +6087,16 @@ cmd_restore(){
       || { rm -rf "$tmp"; die "备份包内 state.env 缺少 ${bk}, 已中止(当前安装未改动)"; }
   done
 
+  # 换 VPS 时公网 IP 会变。探测必须放在任何覆盖动作之前: 以前是覆盖完
+  # state.env 和证书后才发现拿不到 IP, die 了却回不去, 只丢一句备份路径。
+  local _newip
+  _newip=$(get_server_ip)
+  [ -n "$_newip" ] || die "无法获取公网 IPv4, 恢复中止(尚未改动现有配置)"
+
   # 旧状态留一份, 恢复中途失败时还能照着回滚
   if [ -d "$STATE_DIR" ]; then
     rm -rf "${STATE_DIR}.before-restore"
-    cp -a "$STATE_DIR" "${STATE_DIR}.before-restore" 2>/dev/null || true
+    cp -a "$STATE_DIR" "${STATE_DIR}.before-restore" || die "无法备份当前状态, 恢复已取消"
   fi
 
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
@@ -5945,8 +6120,7 @@ cmd_restore(){
   # 换 VPS 时公网 IP 会变, 重新探测, 否则链接里还是旧地址。
   # 探测不到就中止: 空 IP 写进 state.env 会让所有链接变成 uuid@:443, 之后每次
   # 启动都沿用这个空值 —— 比直接失败更难查。
-  SERVER_IP=$(get_server_ip)
-  [ -n "$SERVER_IP" ] || die "无法获取公网 IPv4, 恢复中止。旧状态备份在 ${STATE_DIR}.before-restore"
+  SERVER_IP="$_newip"
   info "服务器 IP: ${SERVER_IP}"
 
   # 新机器上内核参数还是默认值(rmem_max 208KB), 必须在服务启动前生效,
@@ -5990,11 +6164,30 @@ cmd_restore(){
   ok "恢复完成, 凭据与设备列表都已沿用"
 }
 
+# cmd_reset 的回滚兜底。die 是 exit 1, 只有 EXIT trap 能在中途失败时把清空
+# 前的 state.env / users.txt / 证书整份恢复回去。不这么做, 一次 pick_dest
+# 失败就会留下全空的 state.env, 服务还在跑旧配置, 用户却再也拿不到凭据。
+_RESET_BACKUP=""
+_reset_rollback(){
+  [ -n "$_RESET_BACKUP" ] && [ -d "$_RESET_BACKUP" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  if cp -a "$_RESET_BACKUP/." "$STATE_DIR/" 2>/dev/null; then
+    warn "重置未完成, 已自动回滚到重置前的凭据与设备列表"
+  else
+    warn "重置未完成且自动回滚失败! 原始状态保存在 ${_RESET_BACKUP}, 请手动恢复"
+  fi
+}
+
 cmd_reset(){
   need_root
   load_state || die "尚未安装"
   warn "重置会生成新的 UUID / 密钥 / hy2 密码, 所有客户端必须重新导入!"
   ask_yes "确认重置凭据?" || { info "已取消"; return 0; }
+  local _rsbak="${STATE_DIR}.before-reset"
+  rm -rf "$_rsbak"
+  cp -a "$STATE_DIR" "$_rsbak" || die "无法备份当前状态, 重置已取消"
+  _RESET_BACKUP="$_rsbak"
+  trap _reset_rollback EXIT
   UUID=""; PRIV=""; PUB=""; SID=""; HY2_PASS=""; OBFS_PASS=""; DEST=""
   SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""; SB_HEX=""
   HY2_PIN=""; CERT_SPKI_B64=""; CERT_DER_B64=""; CERT_HEX=""
@@ -6008,6 +6201,7 @@ cmd_reset(){
     pick_dest || die "目标站选择失败"
     write_xray_config "$DEST"
     systemctl restart xray >/dev/null 2>&1; sleep 2
+    systemctl is-active --quiet xray || die "xray 重启失败, 查看: journalctl -u xray -n 30"
   elif proto_on hy2 || proto_on anytls || proto_on tuic; then
     pick_dest_simple
   fi
@@ -6020,10 +6214,13 @@ cmd_reset(){
     ensure_sb_creds
     write_singbox_config
     systemctl restart sing-box >/dev/null 2>&1; sleep 2
-    systemctl is-active --quiet sing-box || warn "sing-box 重启异常, 查看: proxy logs sb"
+    systemctl is-active --quiet sing-box || die "sing-box 重启失败, 查看: journalctl -u sing-box -n 30"
   fi
   save_state
   gen_links; gen_sub_files; maybe_sub_http; save_state
+  trap - EXIT
+  _RESET_BACKUP=""
+  rm -rf "$_rsbak"
   print_links
   ok "凭据已重置, 请重新导入所有客户端"
 }
@@ -6387,6 +6584,10 @@ cmd_update(){
 
 cmd_upgrade(){
   need_root
+  # 不 load_state 的话 proto_on reality 会用默认值恒真: 纯 hy2 节点执行 upgrade
+  # 会装出一个没有 service / 配置的孤儿 xray, 再误报"启动失败且无备份"。
+  load_state || die "尚未安装"
+  proto_on reality || die "当前未启用 REALITY, 没有可升级的 xray 内核"
   local target="${1:-latest}" asset tmp sha_arch
   case "$(uname -m)" in
     x86_64|amd64)  asset="Xray-linux-64.zip";        sha_arch="64" ;;
@@ -6577,7 +6778,7 @@ install_clean_gate(){
 
 do_clean(){
   local remove_script="${1:-0}" hop="" hp="" p o
-  local vport="" hport=""
+  local vport="" hport="" allports="" _sp
 
   # 端口跳跃信息随后就被删掉, 先取出来
   # 注意: 不能在这里 load_state, 会把命令行传入的 VLESS_PORT 等环境变量覆盖回旧值
@@ -6588,6 +6789,12 @@ do_clean(){
     # 复查端口用旧配置的端口, 比内存里的更准
     [ -n "$vport" ] || vport=$(state_get "$STATE_FILE" VLESS_PORT 2>/dev/null)
     [ -n "$hport" ] || hport=$(state_get "$STATE_FILE" HY2_PORT 2>/dev/null)
+    # 复查必须覆盖所有启用过的端口, 不能只看 VLESS/HY2 两个。
+    # state 目录随后就被删了, 所以要在这里先取出来。
+    for _sp in VLESS_PORT HY2_PORT SS2022_PORT ANYTLS_PORT TUIC_PORT SUB_PORT; do
+      p=$(state_get "$STATE_FILE" "$_sp" 2>/dev/null) || p=""
+      [ -n "$p" ] && allports="${allports} ${p}"
+    done
   fi
 
   # 旧版还有个 hysteria.service(无 -server 后缀), 不清会留下一个孤儿 unit
@@ -6627,7 +6834,8 @@ do_clean(){
         /usr/local/bin/proxy-healthcheck.sh \
         /etc/sysctl.d/99-proxy-optimize.conf \
         /etc/security/limits.d/99-proxy-nofile.conf \
-        /etc/systemd/journald.conf.d/99-proxy-size.conf
+        /etc/systemd/journald.conf.d/99-proxy-size.conf \
+        "$LOG_FILE" /root/proxy-diag-*.txt "${STATE_DIR}.before-reset"
   sysctl --system >/dev/null 2>&1 || true
   systemctl restart systemd-journald >/dev/null 2>&1 || true
   rm -f /run/proxy-healthcheck.fail /run/proxy-healthcheck.tick
@@ -6647,8 +6855,9 @@ do_clean(){
     fi
   fi
 
-  # 复查端口是否真的空了
-  for p in "${vport:-${VLESS_PORT:-443}}" "${hport:-${HY2_PORT:-443}}"; do
+  # 复查端口是否真的空了: 以前只查 VLESS/HY2, 扩展协议端口漏检
+  [ -n "$allports" ] || allports="${vport:-${VLESS_PORT:-443}} ${hport:-${HY2_PORT:-443}}"
+  for p in $allports; do
     o=$(port_owner "$p" tcp) || o=""
     [ -n "$o" ] && warn "TCP ${p} 仍被其它进程占用: ${o}"
     o=$(port_owner "$p" udp) || o=""
@@ -6741,7 +6950,11 @@ wizard(){
     sel="${sel//,/ }"; sel="${sel//，/ }"; sel="${sel//、/ }"
 
     picked=""; want_clean=0; want_opt=0; want_tz=0; bad=0
-    for tok in $sel; do
+    # 用 read -ra 拆数组, 不用裸 $sel: 后者会做路径名展开, 用户手滑输入
+    # * / ? 时会被当前目录的文件名替换, 表现为莫名其妙选中协议或刷屏。
+    local toks=()
+    read -ra toks <<< "$sel"
+    for tok in "${toks[@]}"; do
       case "$tok" in
         0) info "已退出"; exit 0 ;;
         8) want_opt=1 ;;
@@ -6757,6 +6970,12 @@ wizard(){
         *) warn "无效选项: ${tok}"; bad=1 ;;
       esac
     done
+
+    # 维护项(8/9/c)是"只做这一件事"的分支, 与协议选择互斥。以前输入 "1 8"
+    # 会静默丢掉协议却毫无提示, 用户以为部署完成了。
+    if [ -n "$picked" ] && { [ "$want_opt" = "1" ] || [ "$want_tz" = "1" ] || [ "$want_clean" = "1" ]; }; then
+      warn "维护项(8/9/c)不能与协议选择同时使用; 本次只执行维护项, 协议未部署"
+    fi
 
     # 8: 只做 VPS 优化, 不进入安装
     if [ "$want_opt" = "1" ]; then
@@ -6919,7 +7138,9 @@ menu(){
       t|T) cmd_optimize all ;;
       z|Z) cmd_timezone ;;
       y|Y) cmd_update ;;
-      f|F) CLEAN=1; cmd_install ;;
+      # 和 wizard / deploy_preset 一样, 部署前先对齐版本。export 是因为
+      # maybe_self_update 在有新版时会 exec 换进程, 不导出去 CLEAN 就丢了。
+      f|F) CLEAN=1; export CLEAN; maybe_self_update install; cmd_install ;;
       c|C) cmd_clean ;;
       u|U) cmd_clean ;;
       0|q|Q) exit 0 ;;
@@ -7050,12 +7271,12 @@ main(){
     reset)          cmd_reset ;;
     backup)         cmd_backup "${2:-}" ;;
     restore)        cmd_restore "${2:-}" ;;
-    clean|uninstall|purge) cmd_clean "${2:-}" "${3:-}" ;;
+    clean|uninstall|purge) shift; cmd_clean "$@" ;;
     optimize|opt)   cmd_optimize "${2:-all}" ;;
     timezone|tz)    cmd_timezone "${2:-}" ;;
     wizard|setup)   wizard ;;
     upgrade)        cmd_upgrade "${2:-}" ;;
-    update|selfupdate) cmd_update "${2:-}" "${3:-}" ;;
+    update|selfupdate) shift; cmd_update "$@" ;;
     version|-V|--version) echo "proxy-node v${SCRIPT_VERSION} (${BUILD_DATE})" ;;
     help|-h|--help) usage ;;
     "")

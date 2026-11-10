@@ -13,3 +13,11 @@ proxy-info.txt
 *.key
 *config.json
 *config.yaml
+
+# 部署产物与本地诊断输出(含真实凭据, 绝不进公开仓库)
+*.tar.gz
+proxy-backup-*
+users.txt
+proxy-diag-*.txt
+sub.env
+*.before-reset
