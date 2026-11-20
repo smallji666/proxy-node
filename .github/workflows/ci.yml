@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 语法 / 回归 / 版本一致性 / 去敏
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 工具链硬断言
+        shell: bash
+        run: |
+          # 回归套件里的 JSON 真解析、订阅服务驱动、命令生成器 Node 真跑都靠这两个
+          # 工具。以前 CI 没钉死工具链: 缺了就静默 SKIP, 流水线照样全绿 —— 假绿。
+          for c in bash git curl python3 node md5sum; do
+            command -v "$c" >/dev/null 2>&1 || { echo "缺少必需工具: $c"; exit 1; }
+          done
+          python3 -c 'import json' || { echo "python3 json 模块不可用"; exit 1; }
+          node -e 'process.exit(0)' || { echo "node 无法执行"; exit 1; }
+          echo "OK: $(python3 --version 2>&1) / $(node --version)"
+
+      - name: 行尾必须是 LF
+        shell: bash
+        run: |
+          # Windows 上误提交 CRLF 会让 curl | bash 直接报 "\r: command not found"。
+          # 别用 --include 白名单: LICENSE / .gitattributes / .gitignore 这些无后缀
+          # 文件会漏在外面, 而它们的 CRLF 一样会让 Linux 上的脚本出问题。
+          # -I 跳过二进制; 本仓库全是文本。
+          # 不用 $'\r': 某些 shell(实测 MSYS bash)会把它展开成空串, 空模式会
+          # 匹配所有文件, 闸门变成假红。用 printf 构造并自检长度。
+          cr=$(printf '\r')
+          [ "$(printf '%s' "$cr" | wc -c)" -eq 1 ] || { echo "CR 字节构造失败"; exit 1; }
+          bad=$(grep -rlIU "$cr" --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$bad" ]; then
+            echo "以下文件含 CRLF, Linux 上脚本会直接跑不起来:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 全部 LF"
+
+      - name: 语法与版本子命令
+        shell: bash
+        run: |
+          bash -n setup.sh
+          bash -n setup-proxy.sh
+          bash -n test/run.sh
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh)
+          bdate=$(sed -n 's/^BUILD_DATE="\([^"]*\)".*/\1/p' setup.sh)
+          [ -n "$ver" ] && [ -n "$bdate" ] || { echo "版本字段缺失"; exit 1; }
+          if grep -q '^SCRIPT_EPOCH=' setup.sh; then echo "不应再有 SCRIPT_EPOCH 世代号"; exit 1; fi
+          # 不能给 `bash setup.sh version` 接 head 截首行: head 读够一行就关管道,
+          # 还在往 stdout 写的 setup.sh 会收到 SIGPIPE(exit 141), 在 pipefail
+          # 下整条管道判失败、-e 直接中止步骤 —— 这就是 CI 一直红的原因。
+          # 改成先全量取回, 再用参数展开截掉换行之后的部分。
+          out=$(bash setup.sh version)
+          out=${out%%$'\n'*}
+          [ "$out" = "proxy-node v${ver} (${bdate})" ] || {
+            echo "version 输出 [$out] 与版本字段不一致"; exit 1; }
+          if printf '%s' "$out" | grep -q '世代'; then echo "version 泄露了世代字样"; exit 1; fi
+          echo "OK: v${ver} (${bdate})"
+
+      - name: 文档 / 命令生成器版本对齐
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh)
+          # README 精简后只保留一句"当前 **vX.Y**", 不再有向导标题/版本流水账。
+          # 只查这一处单一来源, 避免为满足 CI 把文档重新注水。
+          grep -qF "当前 **v${ver}**" README.md || { echo "README 当前版本没对齐 v${ver}"; exit 1; }
+          grep -q "class=\"badge\">v${ver}" docs/index.html || { echo "docs badge 没对齐"; exit 1; }
+          grep -q 'mktemp /tmp/pn.XXXXXXXXXX' README.md || { echo "README 一键命令没用随机临时文件"; exit 1; }
+          grep -q 'mktemp /tmp/pn.XXXXXXXXXX' docs/index.html || { echo "docs 命令生成器没用随机临时文件"; exit 1; }
+          echo "OK: README / docs 对齐 v${ver}"
+
+      # 发版字段散落在 setup.sh / README / docs 三处, 以前只查了其中两条。
+      # 一键命令的 raw URL 也有两份: 脚本里由 REPO_URL 拼, docs 里是常量。
+      - name: 发版字段 / 一键链接一致性
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh)
+          bdate=$(sed -n 's/^BUILD_DATE="\([^"]*\)".*/\1/p' setup.sh)
+          [[ "$ver"   =~ ^[0-9]+(\.[0-9]+)*$ ]]      || { echo "SCRIPT_VERSION 格式不对: $ver"; exit 1; }
+          [[ "$bdate" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "BUILD_DATE 格式不对: $bdate"; exit 1; }
+          # 版本严格递增, 不再有世代号
+          if grep -q '^SCRIPT_EPOCH=' setup.sh; then echo "不应再有 SCRIPT_EPOCH 世代号"; exit 1; fi
+          # README 精简后不再维护版本流水账, 只要求"当前版本"与 SCRIPT_VERSION 一致。
+          grep -qF "当前 **v${ver}**" README.md || {
+            echo "README 当前版本与 SCRIPT_VERSION(${ver}) 不一致"; exit 1; }
+          if grep -q '世代' README.md; then echo "README 不应出现世代字样"; exit 1; fi
+          # 两份脚本必须逐字节一致(回归套件里也查一次, 这里单独挡在发版前)
+          cmp -s setup.sh setup-proxy.sh || { echo "setup.sh 与 setup-proxy.sh 不一致"; exit 1; }
+          # SCRIPT_URL 必须是 REPO_URL + /raw/<branch>/setup.sh, 且与 docs 的 REPO 常量同指一处
+          repo_url=$(sed -n 's/^REPO_URL="\([^"]*\)".*/\1/p' setup.sh)
+          script_path=$(sed -n 's#^SCRIPT_URL="\${REPO_URL}\(.*\)".*#\1#p' setup.sh)
+          [ -n "$script_path" ] || { echo "SCRIPT_URL 不再由 REPO_URL 拼出, 无法与文档比对"; exit 1; }
+          owner_repo="${repo_url#https://github.com/}"
+          rel_path=$(printf '%s' "$script_path" | sed 's#^/raw/#/#')
+          want="https://raw.githubusercontent.com/${owner_repo}${rel_path}"
+          docs_url=$(sed -n 's/.*var REPO = "\([^"]*\)".*/\1/p' docs/index.html)
+          [ "$want" = "$docs_url" ] || {
+            echo "一键命令 URL 不一致: setup.sh 推得 [$want], docs 写 [$docs_url]"; exit 1; }
+          grep -qF "curl -fsSL ${want}" README.md || {
+            echo "README 一键命令里的 URL 与 ${want} 不一致"; exit 1; }
+          # ONELINER 的三道保险不能退化。源码里 \$ / \" 是转义后的字面量,
+          # 一律用 grep -F 精确匹配, 别用 BRE(\( 会被当捕获组)。
+          grep -qF 'ONELINER="PN_TMP=\$(mktemp /tmp/pn.XXXXXXXXXX)' setup.sh || { echo "一键命令没用 mktemp"; exit 1; }
+          grep -qF '[ ! -L \"\${PN_TMP}\" ]' setup.sh || { echo "一键命令缺符号链接检查"; exit 1; }
+          grep -qF 'bash -n \"\${PN_TMP}\"' setup.sh || { echo "一键命令缺语法校验"; exit 1; }
+          # 自更新不能只定义 fetch_script_verified 而不调用
+          [ "$(grep -c 'if ! fetch_script_verified "$tmp"; then' setup.sh)" -ge 2 ] || {
+            echo "maybe_self_update / cmd_update 没有都调用 fetch_script_verified"; exit 1; }
+          echo "OK: v${ver} (${bdate}); 一键 URL ${want}"
+
+      # 用 ref_type 而不是前缀 refs/tags/v: 纯数字 tag(1.0) 以前会静默跳过校验。
+      - name: tag 与脚本版本一致
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' setup.sh)
+          [ "$GITHUB_REF_NAME" = "v${ver}" ] || {
+            echo "tag ${GITHUB_REF_NAME} != v${ver}"; exit 1; }
+          echo "OK: tag ${GITHUB_REF_NAME} == v${ver}"
+
+      # CI=true 会让回归套件里的 skip() 直接判 FAIL; 这一层再兜一次 SKIP 字样,
+      # 防止以后有人新加一段 say "SKIP ..." 又把闸门绕过去。
+      - name: 回归套件 (CI 下 SKIP = 失败)
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          rc=0
+          out=$(bash test/run.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q '^SKIP '; then
+            echo "回归套件出现 SKIP, CI 不允许跳过任何检查"; exit 1
+          fi
+          [ "$rc" -eq 0 ] || { echo "回归套件失败 (rc=$rc)"; exit 1; }
+          echo "OK: 回归套件全绿且无 SKIP"
+
+      - name: 敏感信息扫描
+        shell: bash
+        run: |
+          hits=$(grep -rnE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY' \
+                 --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$hits" ]; then echo "疑似硬编码凭据:"; echo "$hits"; exit 1; fi
+          urls=$(grep -rnE 'https://[^/[:space:]]*@github\.com' --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$urls" ]; then echo "发现内嵌凭据的 URL:"; echo "$urls"; exit 1; fi
+          # 本项目自己生成的凭据: 源码里的 UUID="" 是空赋值, 只匹配单引号包住的
+          # 非空字面量, 避免把正常代码判成泄密。
+          own=$(grep -rnE "(UUID|PRIV|PUB|SID|HY2_PASS|OBFS_PASS|SS2022_PASS|ANYTLS_PASS|TUIC_PASS|TUIC_UUID|SUB_TOKEN|SB_PIN|SB_HEX)='[^']{8,}'" \
+                 --exclude-dir=.git . 2>/dev/null || true)
+          if [ -n "$own" ]; then echo "疑似真实的部署凭据被提交:"; echo "$own"; exit 1; fi
+          # 与 .gitignore 保持同一份清单: 备份 / 诊断 / 私钥 / 回滚快照。
+          artifacts=$(git ls-files | grep -E '(^|/)(state\.env|sub\.env|users\.txt|proxy-info\.txt|proxy-backup-[^/]*|proxy-diag-[^/]*\.txt|[^/]*\.tar\.gz|[^/]*\.pem|[^/]*\.key|[^/]*\.before-reset[^/]*|[^/]*\.before-restore[^/]*|[^/]*\.prev)$' || true)
+          if [ -n "$artifacts" ]; then echo "部署产物不应提交:"; echo "$artifacts"; exit 1; fi
+          for pat in '*.pem' '*.key' '*.tar.gz' 'proxy-backup-*' 'proxy-diag-*.txt' '*.before-reset' '*.before-restore*' '*.prev'; do
+            grep -qF "$pat" .gitignore || { echo ".gitignore 缺模式: $pat"; exit 1; }
+          done
+          echo "OK: 无硬编码凭据 / 内嵌凭据 URL / 部署产物; .gitignore 已同步"
+
+      - name: 空白错误
+        shell: bash
+        run: |
+          git diff --check
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            git diff --check HEAD~1 HEAD
+          fi
+          # 单根提交仓库里上面两条恒为空(干净 checkout 没有 diff), 闸门等于没有。
+          # 直接扫整棵已跟踪的树; Markdown 结尾双空格是有意的换行语法, 排除掉。
+          bad=$(git grep -nIE '[[:blank:]]+$' -- . ':(exclude)*.md' 2>/dev/null || true)
+          if [ -n "$bad" ]; then
+            echo "以下文件有行尾空白:"; echo "$bad"; exit 1
+          fi
+          conflicts=$(git grep -nE '^(<<<<<<<|>>>>>>>)' -- . 2>/dev/null || true)
+          if [ -n "$conflicts" ]; then
+            echo "发现未解决的冲突标记:"; echo "$conflicts"; exit 1
+          fi
+          echo "OK: 无空白错误 / 冲突标记"
+
+      - name: shellcheck (参考项, 不计入闸门)
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning setup.sh setup-proxy.sh test/run.sh || \
+            echo "shellcheck 有提示, 仅供参考 —— 硬闸门是上面的回归套件"
