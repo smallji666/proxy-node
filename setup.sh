@@ -3479,7 +3479,13 @@ if on reality && [ $(( n % 6 )) -eq 0 ]; then
 JSON
     /usr/local/bin/xray -c /run/_hc.json >/dev/null 2>&1 &
     hp=$!
-    sleep 3
+    # 等临时 xray 把 SOCKS 端口监听上。固定 sleep 3 在慢机器上不够, 而端口还没
+    # 起来时 curl 立刻拿到 000 —— 连吃两次就判"隧道连续不可用"并重启一次用户
+    # 连接。探测手段自己没准备好, 却去重启被探测的服务, 方向反了。
+    _pw=0
+    while [ "$_pw" -lt 30 ] && ! (exec 3<>/dev/tcp/127.0.0.1/10896) 2>/dev/null; do
+      sleep 0.2; _pw=$((_pw + 1))
+    done
     code=$(curl -s --socks5-hostname 127.0.0.1:10896 -o /dev/null -w '%{http_code}' --max-time 10 https://www.gstatic.com/generate_204 2>/dev/null)
     kill "$hp" >/dev/null 2>&1
     rm -f /run/_hc.json

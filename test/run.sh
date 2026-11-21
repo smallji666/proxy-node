@@ -81,6 +81,9 @@ yesno "healthcheck 里不再 source state.env" "$(no "$CODE" '. "$ST"')"
 # 握手失败被当成服务故障, 连续2次触发无谓重启。
 yesno "healthcheck 白名单含 REALITY_FP" "$(has "$CODE" 'UUID=*|REALITY_FP=*)')"
 yesno "healthcheck 校验 REALITY_FP 防JSON注入" "$(has "$CODE" 'REALITY_FP=chrome ;;')"
+# 探测用的临时 xray 还没监听就去 curl, 拿到的是 000, 连吃两次就判"隧道连续不可用"
+# 并重启一次用户的连接 —— 探测手段自己没准备好, 却去重启被探测的服务。
+yesno "healthcheck 等临时 xray 端口就绪" "$(has "$CODE" '/dev/tcp/127.0.0.1/10896')"
 # cmd_name 改备注时 token 可能重生成, save_state 必须在 gen_sub_files 之后并重启订阅。
 yesno "cmd_name 改备注后 save_state 在 gen_sub_files 之后" "$(awk '
   /^cmd_name\(\)/ { in_fn=1 }
