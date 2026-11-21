@@ -250,8 +250,10 @@ yesno "xray 镜像核对提示走 stderr" "$(has "$CODE" '已用两个镜像交�
 yesno "xray 内置兜底提示走 stderr" "$(has "$CODE" '改用脚本内置哈希校验 Xray v${ver}" >&2')"
 yesno "xray 冲突详情走 stderr" "$(has "$CODE" '官方校验值与脚本内置值不一致, 拒绝安装:" >&2')"
 # effective_default_node 的 stdout 就是节点名
-yesno "默认节点警告走 stderr" "$(has "$CODE" '但本次未启用 hysteria2, 仍用 reality" >&2')"
-yesno "非法 DEFAULT_NODE 警告走 stderr" "$(has "$CODE" '按 reality 处理" >&2')"
+yesno "默认节点警告走 stderr" "$(has "$CODE" '但本次未启用 hysteria2, 仍用 ${pick}" >&2')"
+yesno "非法 DEFAULT_NODE 警告走 stderr" "$(has "$CODE" '不认识(可选 reality / hy2), 按 ${pick} 处理" >&2')"
+# 没启用 REALITY 时不能照报 reality: 那个出站不存在, 订阅里也没有对应节点
+yesno "默认节点跟随实际启用的协议" "$(has "$CODE" 'if proto_on reality; then pick=reality')"
 # version 的哈希标签必须是 sha256
 yesno "version 不再把 sha256 标成 md5" "$(no "$CODE" 'echo "md5 :')"
 yesno "version 用 sha256 标签" "$(has "$CODE" 'echo "sha256: $(file_sha256')"
@@ -360,7 +362,11 @@ yesno "clash nameserver-policy 段" "$(has "$CODE" 'nameserver-policy:')"
 yesno "clash STUN UDP 端口拦截" "$(has "$CODE" 'STUN_WEBRTC_PORTS')"
 yesno "clash 校验器纳入 STUN 顺序" "$(has "$CODE" 'DST-PORT,3478.*REJECT')"
 yesno "singbox STUN 域名拦截" "$(has "$CODE" 'render_stun_sb_domains')"
-yesno "singbox STUN UDP 端口拦截" "$(has "$CODE" 'STUN_SB_PORTS')"
+yesno "singbox STUN UDP 端口拦截" "$(has "$CODE" 'render_stun_sb_ports')"
+# 端口列表也只能有一份: 以前 sing-box 的 "port"/"port_range" 是手写常量,
+# 等于把 STUN_WEBRTC_PORTS 抄了第二遍, 改了上面漏了下面就是静默失效。
+yesno "singbox 端口从同一份数据源现算" "$(has "$CODE" '"port_range": [%s]')"
+yesno "不再有手写的 sing-box 端口常量" "$(no "$CODE" 'STUN_SB_PORTS=')"
 yesno "singbox STUN 用 block 出站(兼容1.12)" "$(has "$CODE" '"outbound": "block"')"
 
 # ---- 三端 writer 结构对称: 每端一个独立生成函数, 都能单独跑测试 ----
@@ -494,6 +500,29 @@ yesno "出口实测复用同一套隧道" \
   "$([ "$(awk '/^egress_ip_via_proxy\(\)\{/,/^}/' "$SRC" | grep -c 'tunnel_start')" = 1 ] && echo yes || echo no)"
 yesno "dnstest 明确划出客户端边界" "$(has "$CODE" '客户端侧(服务端测不到')"
 yesno "有 dnstest 行为验证脚本" "$([ -f test/dnstest_behavior.sh ] && echo yes || echo no)"
+
+# ---- 证书指纹: 两种算法都要真的算出来 ----
+# hysteria2 的 pinSHA256 要整证书 DER 的 hex, sing-box 要公钥 SPKI 的 base64。
+# 曾经这里只剩 SPKI 一项、CERT_HEX 全脚本没人赋值 —— compute_cert_pins 恒失败,
+# ensure_hy2 每次都 die, 默认组合 reality,hy2 根本装不完。这条断言守的就是它。
+yesno "compute_cert_pins 真的算整证书 hex" \
+  "$(has "$CODE" 'CERT_HEX=$(openssl x509 -in "$cert" -noout -fingerprint -sha256')"
+yesno "compute_cert_pins 真的算 SPKI base64" \
+  "$(has "$CODE" 'CERT_SPKI_B64=$(openssl x509 -in "$cert" -pubkey -noout')"
+yesno "证书指纹函数可传路径(可测)" "$(has "$CODE" 'local cert="${1:-/etc/hysteria/cert.pem}"')"
+yesno "HY2 的 pin 取自整证书 hex" "$(has "$CODE" 'HY2_PIN="${CERT_HEX:-}"')"
+yesno "有证书指纹行为验证脚本" "$([ -f test/cert_pin_behavior.sh ] && echo yes || echo no)"
+
+# 凭据键"只读不写"是这一类缺陷的共同形态: 键被写进 state.env、被 safe_cred_scalars
+# 校验、被 die 分支当成功条件, 却没有任何一处真的给它赋值。用 KEY="" 清空也算赋值,
+# 所以这里要求赋值右侧不是空串。CRED_KEYS 里每个键都必须有一条这样的赋值。
+cred_noassign=""
+for _ck in $(sed -n 's/^CRED_KEYS="\(.*\)"/\1/p' "$SRC"); do
+  grep -qE "(^|[[:space:];])(local[[:space:]]+)?${_ck}=(\"|')?[^\"'[:space:];]" "$SRC" \
+    || cred_noassign="${cred_noassign} ${_ck}"
+done
+yesno "凭据键都有真实赋值来源${cred_noassign:+ (缺:${cred_noassign})}" \
+  "$([ -z "$cred_noassign" ] && echo yes || echo no)"
 
 # ---- 全项目加固回归: D-F 内核兼容 / 自检 / 失败聚合 / 链接 ----
 yesno "sing-box 真实探测 AF_INET6" "$(has "$CODE" 'socket.AF_INET6')"
@@ -1262,10 +1291,11 @@ for pair in \
   "hy2_hash_behavior.sh:17" \
   "hy2_resolve_behavior.sh:8" \
   "shadowrocket_conf_behavior.sh:55" \
-  "rule_source_behavior.sh:9" \
+  "rule_source_behavior.sh:15" \
   "clash_yaml_behavior.sh:41" \
   "egress_behavior.sh:32" \
-  "dnstest_behavior.sh:38"; do
+  "dnstest_behavior.sh:38" \
+  "cert_pin_behavior.sh:13"; do
   bt="${pair%%:*}"; bmin="${pair##*:}"
   if [ ! -f "test/$bt" ]; then
     fail "缺少行为验证脚本 test/$bt"

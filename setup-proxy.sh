@@ -147,8 +147,7 @@ CLEAN="${CLEAN:-0}"
 # 再写一遍域名/端口 —— 历史上三份硬编码已经漂移过(Claude 域名清单 4 处
 # 内容不一致), 单一数据源 + 校验器共用是防漂移的根本手段。
 STUN_DOMAINS=(stun.l.google.com stun1.l.google.com stun2.l.google.com stun3.l.google.com stun4.l.google.com stun.services.mozilla.com stun.cloudflare.com)
-STUN_WEBRTC_PORTS=(3478 5349 19302-19309)   # Clash DST-PORT 语法(区间用 -)
-STUN_SB_PORTS='"port": [3478, 5349], "port_range": ["19302:19309"]'  # sing-box 语法(区间用 :)
+STUN_WEBRTC_PORTS=(3478 5349 19302-19309)   # 区间用 -, 三端语法在 render_* 里各自转换
 DNS_DOH_FOREIGN="https://cloudflare-dns.com/dns-query"
 DNS_DOH_FOREIGN2="https://dns.google/dns-query"
 DNS_DOH_CN="https://doh.pub/dns-query"
@@ -173,6 +172,21 @@ render_stun_sb_domains(){
     out="${out}\"${d}\","
   done
   printf '%s' "${out%,}"
+}
+# 渲染 STUN 端口为 sing-box 的两个字段: 单端口走 "port", 区间走 "port_range"
+# (语法不同, 区间用 : 而不是 -)。以前这里是一段手写的常量, 等于把
+# STUN_WEBRTC_PORTS 抄了第二遍 —— 上面加一个端口、这里忘了改, sing-box 端就
+# 少拦一个, WebRTC 照样漏真实 IP, 而三端"看起来"都配好了。现算, 永不漂移。
+render_stun_sb_ports(){
+  local p ports="" ranges=""
+  for p in "${STUN_WEBRTC_PORTS[@]}"; do
+    case "$p" in
+      *-*) ranges="${ranges}\"${p/-/:}\", " ;;
+      *)   ports="${ports}${p}, " ;;
+    esac
+  done
+  # 分隔符用 ", " 而不是 ",": 与改造前手写的常量逐字节一致, 订阅产物不变。
+  printf '"port": [%s], "port_range": [%s]' "${ports%, }" "${ranges%, }"
 }
 # 校验器: 从单一数据源算出"第一条 STUN 规则长什么样", 避免校验器里再硬编码一份
 stun_sr_first(){ printf 'DOMAIN-SUFFIX,%s,REJECT-NO-DROP' "${STUN_DOMAINS[0]}"; }
@@ -487,6 +501,9 @@ valid_bind(){
   [ "$#" -eq 4 ] || return 1
   for o in "$@"; do
     case "$o" in ''|*[!0-9]*) return 1 ;; esac
+    # 与 valid_ipv4 同一条规则: 前导零的段一律拒绝(八进制歧义)。
+    # 这个值会进 systemd 的 ExecStart, 写错了服务只会静默起不来。
+    case "$o" in 0) ;; 0*) return 1 ;; esac
     [ "$o" -le 255 ] || return 1
   done
   return 0
@@ -535,10 +552,14 @@ save_state(){
   # 所有值统一过 sh_quote, 单引号/换行都不可能逃出这一行。
   local tmp
   tmp=$(mktemp "${STATE_DIR}/.state.XXXXXXXX") || die "无法创建 state.env 临时文件"
+  # 安装时间先落到变量里再写文件。只在 state_line 里内联 $(date) 的话, 时间
+  # 只进了文件、没进变量 —— 同一个进程后面再打印"安装时间"就是空的
+  # (全新安装结束时 proxy install 会打印一次, 那时看着像丢了数据)。
+  INSTALLED_AT="${INSTALLED_AT:-$(date '+%Y-%m-%d %H:%M:%S')}"
   {
     echo "# 由 proxy-installer 自动生成, 请勿手工编辑"
     echo "# 数据文件: 只按白名单键逐行解析, 从不被 source / eval"
-    state_line INSTALLED_AT "${INSTALLED_AT:-$(date '+%Y-%m-%d %H:%M:%S')}"
+    state_line INSTALLED_AT "${INSTALLED_AT:-}"
     state_line XRAY_VERSION "${XRAY_VERSION:-}"
     state_line NODE_NAME "${NODE_NAME:-Node}"
     state_line SERVER_IP "${SERVER_IP:-}"
@@ -617,7 +638,8 @@ update_state_kv(){
 
 # load_state 之后, 把用户本次显式传入的环境变量覆盖回来
 apply_env_overrides(){
-  local _k _v
+  # _d 也要声明成 local: 漏了就会写进全局, 之后任何同名局部变量都会被它污染。
+  local _k _v _d
   [ "$_RAW_VLESS_PORT"   != "__unset__" ] && VLESS_PORT="$_RAW_VLESS_PORT"
   [ "$_RAW_HY2_PORT"     != "__unset__" ] && HY2_PORT="$_RAW_HY2_PORT"
   # Xray 版本: 用户显式传了就固定; 没传则一律追最新, 不信任 state.env 里的
@@ -1187,14 +1209,14 @@ ensure_xray(){
   local tmp; tmp=$(mktemp -d) || die "无法创建临时目录"
   download_with_mirror \
     "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${asset}" \
-    "$tmp/x.zip" || die "Xray 下载失败(检查服务器能否访问 GitHub)"
+    "$tmp/x.zip" || { rm -rf "$tmp"; die "Xray 下载失败(检查服务器能否访问 GitHub)"; }
   local _want_sha
   _want_sha=$(xray_expected_sha "$XRAY_VERSION" "$sha_arch" "$asset") \
     || { rm -rf "$tmp"; die "Xray 校验值获取失败, 已中止"; }
   verify_sha256 "$tmp/x.zip" "$_want_sha" "Xray v${XRAY_VERSION}" \
     || { rm -rf "$tmp"; die "Xray 校验未通过, 已中止"; }
-  unzip -o -q "$tmp/x.zip" -d "$tmp/pkg" || die "Xray 解压失败"
-  [ -f "$tmp/pkg/xray" ] || die "压缩包内未找到 xray"
+  unzip -o -q "$tmp/x.zip" -d "$tmp/pkg" || { rm -rf "$tmp"; die "Xray 解压失败"; }
+  [ -f "$tmp/pkg/xray" ] || { rm -rf "$tmp"; die "压缩包内未找到 xray"; }
   systemctl stop xray >/dev/null 2>&1 || true
   install -m 755 "$tmp/pkg/xray" "$XRAY_BIN"
   mkdir -p /usr/local/etc/xray /usr/local/share/xray /var/log/xray
@@ -1372,7 +1394,10 @@ parse_egress(){
   # 无论从环境变量还是命令行进来, 都在这里统一拦掉。
   # 控制字符(换行/制表)同样致命: JSON 字符串里出现裸换行就是非法 JSON,
   # 而写进 state.env 会多出一行, 下次 load_state 直接 source 到垃圾。
-  case "$u" in *'"'*|*"'"*|*\\*) return 1 ;; esac
+  # '|' 也必须拦: 本函数返回的是 '|' 分隔的五段记录, 用户名/密码里带一个竖线
+  # 就会把下游的 `IFS='|' read -r scheme host port user pass` 拆错位 ——
+  # 密码的后半截被当成主机名, 报出来的错误指向完全无关的地方。
+  case "$u" in *'"'*|*"'"*|*\\*|*'|'*) return 1 ;; esac
   case "$u" in *[[:cntrl:]]*) return 1 ;; esac
   case "$u" in
     *://*) scheme="${u%%://*}"; rest="${u#*://}" ;;
@@ -1423,6 +1448,9 @@ valid_ipv4(){
   [ "$#" -eq 4 ] || return 1
   for o in "$@"; do
     [ -n "$o" ] || return 1
+    # 前导零在 IPv4 里有歧义: 有的实现按八进制解析(010 = 8), 有的直接拒收。
+    # 放过去就会被写进订阅链接和 JSON, 服务端与客户端各自解析成不同地址。
+    case "$o" in 0) ;; 0*) return 1 ;; esac
     [ "$o" -le 255 ] 2>/dev/null || return 1
   done
   return 0
@@ -2244,12 +2272,12 @@ ensure_singbox(){
   tmp=$(mktemp -d) || die "无法创建临时目录"
   download_with_mirror \
     "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/${asset}" \
-    "$tmp/sb.tar.gz" || die "sing-box 下载失败(检查服务器能否访问 GitHub)"
+    "$tmp/sb.tar.gz" || { rm -rf "$tmp"; die "sing-box 下载失败(检查服务器能否访问 GitHub)"; }
   verify_sha256 "$tmp/sb.tar.gz" "$(pinned_sha "singbox-${arch}-${SB_VERSION}")" "sing-box v${SB_VERSION}" \
     || { rm -rf "$tmp"; die "sing-box 校验未通过, 已中止"; }
-  tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || die "sing-box 解压失败"
+  tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || { rm -rf "$tmp"; die "sing-box 解压失败"; }
   bin=$(find "$tmp" -type f -name sing-box 2>/dev/null | head -1)
-  [ -n "$bin" ] || die "压缩包内未找到 sing-box"
+  [ -n "$bin" ] || { rm -rf "$tmp"; die "压缩包内未找到 sing-box"; }
   systemctl stop sing-box >/dev/null 2>&1 || true
   install -m 755 "$bin" "$SB_BIN"
   rm -rf "$tmp"
@@ -2368,6 +2396,12 @@ sb_listen_addr(){
 
 write_singbox_config(){
   sb_enabled || return 0
+  # users.txt 是设备凭据的唯一来源: xray clients / sing-box users / 分享链接
+  # 三处都从它派生。少了它, sb_users_json 会退回 TUIC_UUID / ANYTLS_PASS 那套
+  # 老字段, 而 gen_links 用的是 users.txt 首行(退化成 $UUID) —— 两边算出的
+  # 凭据不同, 客户端导进去必然连不上, 且报错指向"密码错误"这种误导方向。
+  # 这里先确保它在, 让三处永远读同一份。幂等: 已存在时什么都不做。
+  ensure_users_file
   local tls_h2 tls_h3 dest sb_listen
   # server_name 不能空: 证书 CN 那边已经兜底成 www.bing.com, 这里必须跟着一致
   dest="${DEST:-www.bing.com}"
@@ -2580,19 +2614,26 @@ UNIT
   ok "sing-box 运行中: $(sb_port_summary)"
 }
 
-# 自签证书的三种指纹表示, 对应不同客户端字段(算法不同, 不能混用):
+# 自签证书的两种指纹表示, 对应不同客户端字段(算法不同, 不能混用):
 #   整证书 SHA-256 (hex)    -> hysteria2 URI / 配置里的 pinSHA256; mihomo 的 fingerprint
 #                              已用 `hysteria cert` 的输出核对过, 就是整证书 DER 的 hex
 #   SPKI 公钥 SHA-256 (b64) -> sing-box 的 certificate_public_key_sha256
-#   整证书 SHA-256 (b64)    -> 部分实现按整证书 base64 校验, 作为兜底
 compute_cert_pins(){
-  local cert=/etc/hysteria/cert.pem
+  # $1 可选, 默认就是 hysteria2 的证书路径。做成参数是为了能被回归套件
+  # 用一张临时证书直接验证 —— 否则这段唯一的算法只能靠肉眼审。
+  local cert="${1:-/etc/hysteria/cert.pem}"
   [ -f "$cert" ] || return 1
   CERT_SPKI_B64=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null \
     | openssl pkey -pubin -outform der 2>/dev/null \
     | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)
-  # 客户端真正消费的是 SPKI(证书固定)与 HEX(诊断展示); DER 那份从来没被读过,
-  # 旧版把它列进成功条件, openssl 偶发失败就整个部署 die —— 去掉。
+  # CERT_HEX 是 hysteria2 的 pinSHA256: **整张证书 DER** 的 SHA-256, 小写 hex 无冒号。
+  # 它和上面的 SPKI 不是一回事(SPKI 只覆盖公钥, 给 sing-box 用), 两个都要算。
+  # 曾经这里只剩 SPKI 一项, CERT_HEX 全脚本没人赋值 —— 于是本函数恒返回失败,
+  # ensure_hy2 每次都 die 在"证书指纹计算失败", 默认组合 reality,hy2 直接装不完。
+  # 算法与 SB_HEX 保持一致, 两处不要各写一份。
+  CERT_HEX=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
+  # DER 那份从来没被读过, 不再列进成功条件: openssl 偶发失败就整个部署 die 不值得。
   [ -n "$CERT_SPKI_B64" ] && [ -n "$CERT_HEX" ]
 }
 
@@ -3669,10 +3710,8 @@ gen_links(){
   # 只能 insecure; SS2022 没有 TLS, 根本不需要证书固定。三者的分享链接
   # 都别当成"已固定证书", 真固定只在 singbox.json(1.13+)里。
   if sb_enabled; then
-    local pu pn ss_ui
+    local pu ss_ui
     pu="$PRIMARY_UUID"
-    pn=$(awk -F'|' -v u="$pu" '$1==u{print $2; exit}' "$USERS_FILE" 2>/dev/null)
-    [ -n "$pn" ] || pn="default"
 
     if proto_on ss2022; then
       # SIP002: base64url(method:password), 去掉 padding
@@ -3890,7 +3929,7 @@ JSON
     #   域名规则拦常见 STUN 域名; 端口规则拦 UDP 3478/5349/19302-19309, 都送 block 出站。
     # 域名与端口必须分两条: 同一 rule 里 domain + port 是"与"关系, 合写会漏。
     # 用 outbound:block 而非 action:reject, 兼容 1.11/1.12(见上方 block 出站注释)。
-    printf '  "route": {\n    "rules": [\n      { "port": 53, "action": "hijack-dns" },\n      { "domain_suffix": [%s], "outbound": "block" },\n      { "network": "udp", %s, "outbound": "block" }\n    ],\n    "final": "%s",\n    "auto_detect_interface": true,\n    "default_domain_resolver": "local"\n  }\n' "$(render_stun_sb_domains)" "$STUN_SB_PORTS" "$first_tag"
+    printf '  "route": {\n    "rules": [\n      { "port": 53, "action": "hijack-dns" },\n      { "domain_suffix": [%s], "outbound": "block" },\n      { "network": "udp", %s, "outbound": "block" }\n    ],\n    "final": "%s",\n    "auto_detect_interface": true,\n    "default_domain_resolver": "local"\n  }\n' "$(render_stun_sb_domains)" "$(render_stun_sb_ports)" "$first_tag"
     echo "}"
   } > "$out"
 }
@@ -3900,7 +3939,9 @@ JSON
 # 这个返回值在 if 里被当成"假", 反而把非法值放过去写进 JSON/YAML。
 # 只允许 1..10000, 用长度 + 字符串判断, 不受算术溢出影响。
 hy2_bw_ok(){
-  local v="$1"
+  # 用 ${1:-} 而不是 $1: set -u 下无参调用会直接中止整个脚本, 而这里
+  # 只该回答"这个值合法吗", 空值就是不合法。
+  local v="${1:-}"
   [[ "$v" =~ ^[1-9][0-9]*$ ]] || return 1
   [ "${#v}" -le 4 ] && return 0
   [ "$v" = "10000" ] && return 0
@@ -3915,16 +3956,26 @@ hy2_bw_ok(){
 # 没开 hy2 时, _dn 会变成"警告文字 + reality"两行, 后面 `[ "$_dn" = hy2 ]`
 # 永远不成立(默认节点被静默改掉), info 里还会印出两行乱码。
 effective_default_node(){
-  case "${DEFAULT_NODE:-reality}" in
+  local want="${DEFAULT_NODE:-reality}" pick=""
+  # 先算出"实际存在"的那个默认节点。没启用 REALITY 时不能照报 reality ——
+  # 那个出站根本不在订阅里, 三份 writer 各自兜底换成别的协议, 而 proxy sub
+  # 的输出仍然印着 reality: 用户拿着这句话去客户端里找, 找不到一个叫
+  # "VLESS/REALITY" 的节点, 只能怀疑订阅坏了。
+  if proto_on reality; then pick=reality
+  elif proto_on hy2;    then pick=hy2
+  elif proto_on ss2022; then pick=ss2022
+  elif proto_on anytls; then pick=anytls
+  elif proto_on tuic;   then pick=tuic
+  else                       pick=reality
+  fi
+  case "$want" in
     hy2|hysteria2)
-      if proto_on hy2; then echo hy2; else
-        warn "DEFAULT_NODE=hy2 但本次未启用 hysteria2, 仍用 reality" >&2
-        echo reality
-      fi ;;
-    reality|vless|"") echo reality ;;
-    *) warn "DEFAULT_NODE='${DEFAULT_NODE}' 不认识(可选 reality / hy2), 按 reality 处理" >&2
-       echo reality ;;
+      if proto_on hy2; then echo hy2; return 0; fi
+      warn "DEFAULT_NODE=hy2 但本次未启用 hysteria2, 仍用 ${pick}" >&2 ;;
+    reality|vless|"") ;;
+    *) warn "DEFAULT_NODE='${want}' 不认识(可选 reality / hy2), 按 ${pick} 处理" >&2 ;;
   esac
+  echo "$pick"
   return 0
 }
 
@@ -4780,7 +4831,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         # token 必须真的等于本次订阅目录名。只靠"目录名难猜"不够:
         # 订阅根目录下若还有别的子目录, 里面的同名文件也会被读到。
-        if not TOKEN or not hmac.compare_digest(parts[0], TOKEN):
+        # 比的是 bytes 不是 str: hmac.compare_digest 对含非 ASCII 字符的 str
+        # 直接抛 TypeError, 请求路径里塞一个 %C3%A9 就能把一次 404 变成一次
+        # 未捕获异常(连接被直接掐断, 日志里一堆 traceback)。
+        if not TOKEN or not hmac.compare_digest(
+            parts[0].encode("utf-8", "surrogateescape"),
+            TOKEN.encode("utf-8", "surrogateescape"),
+        ):
             self.send_error(404)
             return
         full = os.path.realpath(os.path.join(ROOT, parts[0], parts[1]))
@@ -6104,7 +6161,7 @@ diag_out_path(){
 
 cmd_diag(){
   need_root
-  local out raw installed=0 u act en rst found
+  local out raw installed=0 u act en rst found _ipt _listen
   diag_out_path "${1:-}" || die "${DIAG_PATH_ERR}"
   out="$DIAG_OUT"
   raw=$(mktemp 2>/dev/null) || die "无法创建临时文件"
@@ -7316,7 +7373,9 @@ cmd_user(){
   load_state || die "尚未安装"
   ensure_users_file
   SERVER_IP="${SERVER_IP:-$(get_server_ip)}"
-  local sub="${1:-list}"
+  # u/n/d 是下面 list 分支 `read -r u n d` 的接收变量。不声明成 local 就会
+  # 泄漏成全局, 和 state.env 里的同名键(没有, 但将来可能有)撞车。
+  local sub="${1:-list}" u n d
 
   case "$sub" in
     add)
@@ -7852,8 +7911,6 @@ cleanup_stale_scripts(){
     # 比当前这份还新的不删。说明用户手里有更新的副本(比如这次误跑了旧路径),
     # 删掉它等于把唯一的新版扔了 —— 保留并提示, 让用户自己决定跑哪份。
     cv=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$c" 2>/dev/null | head -1)
-    # 比当前这份还新的不删。说明用户手里有更新的副本(比如这次误跑了旧路径),
-    # 删掉它等于把唯一的新版扔了 —— 保留并提示, 让用户自己决定跑哪份。
     if [ -n "$cv" ] && script_newer "$cv"; then
       echo -e "  ${D}保留更新的副本: ${c} (v${cv} > 当前 v${SCRIPT_VERSION})${N}"
       continue
@@ -8091,7 +8148,7 @@ cmd_update(){
 
   # 用 mv 而不是重定向覆盖: bash 是边读边执行脚本文件的, 就地覆盖会让正在跑的
   # 这一份读到半新半旧的内容。mv 换 inode, 当前进程继续读旧 inode, 不受影响。
-  install_script_file "$tmp" "$self" || die "写入 ${self} 失败(旧版本未改动, 可用 proxy update rollback 确认)"
+  install_script_file "$tmp" "$self" || { rm -f "$tmp"; die "写入 ${self} 失败(旧版本未改动, 可用 proxy update rollback 确认)"; }
   ln -sf "$self" "/usr/local/bin/${APP_NAME}" 2>/dev/null
 
   ok "已更新: v${cur} -> v${newv}"

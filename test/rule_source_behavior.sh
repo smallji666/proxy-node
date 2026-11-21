@@ -30,6 +30,8 @@ render_all(){
     render_stun_clash
     echo "---"
     render_stun_sb_domains
+    echo "---"
+    render_stun_sb_ports
   ' _ "$FNS" 2>/dev/null
 }
 
@@ -42,15 +44,37 @@ t "基线: sing-box JSON 数组非空" "$([ -n "$(printf '%s\n' "$BASE" | tail -
 # 篡改数据源: 数组末尾加一条
 sed "s/^STUN_DOMAINS=(/STUN_DOMAINS=($CANARY /" "$SRC" \
   | sed -n '/^# ======================= 客户端防护规则: 单一数据源/,/^# ===================== 单一数据源结束/p' > "$TD/mutant.sh"
-MUT=$(bash -c 'source "$1"; render_stun_sr; echo "---"; render_stun_clash; echo "---"; render_stun_sb_domains' _ "$TD/mutant.sh" 2>/dev/null)
+MUT=$(bash -c 'source "$1"; render_stun_sr; echo "---"; render_stun_clash; echo "---"; render_stun_sb_domains; echo "---"; render_stun_sb_ports' _ "$TD/mutant.sh" 2>/dev/null)
 
 t "变异: 小火箭同步新增域名" "$(printf '%s\n' "$MUT" | grep -c "DOMAIN-SUFFIX,${CANARY},REJECT-NO-DROP")" "1"
 t "变异: Clash 同步新增域名" "$(printf '%s\n' "$MUT" | grep -c "DOMAIN-SUFFIX,${CANARY},REJECT$")" "1"
-t "变异: sing-box 同步新增域名" "$(printf '%s\n' "$MUT" | tail -1 | grep -c "$CANARY")" "1"
+t "变异: sing-box 同步新增域名" "$(printf '%s\n' "$MUT" | grep -c "^\"${CANARY}\"")" "1"
 t "变异: 三端总数都+1" "$(printf '%s\n' "$MUT" | grep -c 'REJECT-NO-DROP')" "8"
 
 # 反向: 基线不含 canary(证明上面不是恒真)
 t "基线不含 canary(反向守卫)" "$(printf '%s\n' "$BASE" | grep -c "$CANARY" || true)" "0"
+
+# ---------------------------------------------------------------- 端口维度
+# 端口列表同样只允许一份。以前 sing-box 的 "port"/"port_range" 是手写常量,
+# 把 STUN_WEBRTC_PORTS 抄了第二遍 —— 改上面漏下面, sing-box 端少拦一个端口,
+# WebRTC 照样漏真实 IP, 而三端"看起来"都配好了。
+SB_PORTS_BASE=$(printf '%s\n' "$BASE" | tail -1)
+t "基线: sing-box 单端口列表" "$(printf '%s' "$SB_PORTS_BASE" | grep -c '"port": \[3478, 5349\]')" "1"
+t "基线: sing-box 端口区间转成冒号语法" "$(printf '%s' "$SB_PORTS_BASE" | grep -c '"port_range": \["19302:19309"\]')" "1"
+
+# 往端口数据源里加一个单端口, 三端必须同时出现
+sed 's/^STUN_WEBRTC_PORTS=(/STUN_WEBRTC_PORTS=(40000 /' "$SRC" \
+  | sed -n '/^# ======================= 客户端防护规则: 单一数据源/,/^# ===================== 单一数据源结束/p' > "$TD/mutport.sh"
+MP=$(bash -c 'source "$1"; render_stun_clash; echo "---"; render_stun_sb_ports' _ "$TD/mutport.sh" 2>/dev/null)
+t "端口变异: Clash 同步新增" "$(printf '%s\n' "$MP" | grep -c 'DST-PORT,40000')" "1"
+t "端口变异: sing-box 同步新增" "$(printf '%s\n' "$MP" | tail -1 | grep -c '"port": \[40000, 3478, 5349\]')" "1"
+
+# 再加一个区间, sing-box 必须转成冒号写法而不是照抄连字符
+sed 's/^STUN_WEBRTC_PORTS=(/STUN_WEBRTC_PORTS=(40000-40010 /' "$SRC" \
+  | sed -n '/^# ======================= 客户端防护规则: 单一数据源/,/^# ===================== 单一数据源结束/p' > "$TD/mutrange.sh"
+MR=$(bash -c 'source "$1"; render_stun_sb_ports' _ "$TD/mutrange.sh" 2>/dev/null)
+t "区间变异: 转成冒号语法" "$(printf '%s' "$MR" | grep -c '"port_range": \["40000:40010", "19302:19309"\]')" "1"
+t "区间变异: 不残留连字符写法" "$(printf '%s' "$MR" | grep -c '40000-40010')" "0"
 
 echo "P=$P F=$F"
 [ "$F" -eq 0 ]
