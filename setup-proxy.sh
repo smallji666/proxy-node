@@ -323,6 +323,25 @@ hr(){ echo -e "${D}------------------------------------------------------------$
 
 need_root(){ [ "$(id -u)" -eq 0 ] || die "请用 root 运行"; }
 
+# 安装/升级/重置/清理互斥。
+# 一次安装要下载三个二进制, 慢的时候好几分钟; 用户以为卡住了就再开一个窗口重跑,
+# 是很常见的事。两个进程会各自写 state.env(里面是 UUID 和私钥)、各自改 systemd
+# 单元、各自往 iptables 里加规则, 最后留下哪一份取决于谁后退出 —— 最坏的情况是
+# 凭据对不上, 客户端全部失效。
+# 用 flock 而不是 mkdir 锁: flock 在进程退出(包括被 kill -9)时由内核释放, 不会
+# 留下"僵尸锁"把用户挡在门外。拿不到锁就直接报错退出, 不排队等 —— 等待会让人
+# 以为卡死, 而重跑一次的成本很低。
+acquire_lock(){
+  # 路径可被 PROXY_LOCK_FILE 覆盖: 回归套件要在临时目录里验"锁被占时是否立刻失败",
+  # 写死 /run 的话测试要么没权限、要么得动真文件, 只能跳过 —— 那等于没测。
+  local lf="${PROXY_LOCK_FILE:-/run/proxy-node.lock}"
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>>"$lf" 2>/dev/null || return 0
+  flock -n 9 && return 0
+  die "另一个 proxy 进程正在安装/升级(锁: ${lf})。等它结束后再试;
+若确认没有别的进程在跑, 用 lsof ${lf} 查一下占用者"
+}
+
 # 协议开关: proto_on reality / proto_on ss2022 ...
 proto_on(){
   case ",${PROTOCOLS}," in
@@ -2092,6 +2111,22 @@ pick_dest_simple(){
 }
 
 ensure_xray_service(){
+# 设开机自启, 并且**验证真的设上了**。
+# 以前这里一律 `systemctl enable X >/dev/null 2>&1`, 返回值直接丢掉。systemd 在
+# /etc 只读、单元被 mask、或 systemd 自身处于降级状态时会拒绝 enable —— 而这件事
+# 只在**下一次重启**才暴露: 装完 proxy verify 全绿, 重启后节点静默消失, 用户完全
+# 看不出原因。当时 verify 也只查 is-active(进程现在活着), 不查 is-enabled(开机起
+# 不起), 所以这条路径上没有任何一处会报错。现在 enable 完立刻复查, 失败就明说该
+# 敲什么命令。
+enable_unit(){
+  local u="$1"
+  systemctl enable "$u" >/dev/null 2>&1 || true
+  systemctl is-enabled --quiet "$u" 2>/dev/null && return 0
+  warn "无法设置开机自启: ${u} —— 重启后该服务不会自动启动"
+  warn "请手动执行: systemctl enable ${u}   然后跑 proxy verify 复查"
+  return 1
+}
+
   # FORCE_UNIT_REFRESH: proxy update 用它强制重写单元, 否则旧 unit 只要还含
   # PrivateTmp=true 就永远不会被新版本里的沙箱改动覆盖。
   if [ ! -f /etc/systemd/system/xray.service ] || ! grep -q 'PrivateTmp=true' /etc/systemd/system/xray.service \
@@ -2134,7 +2169,7 @@ WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
   fi
-  systemctl enable xray >/dev/null 2>&1
+  enable_unit xray
 }
 
 # ---------------- Hysteria2 ----------------
@@ -2351,7 +2386,7 @@ WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
   fi
-  systemctl enable hysteria-server >/dev/null 2>&1
+  enable_unit hysteria-server
   systemctl restart hysteria-server >/dev/null 2>&1
   # 全部改成轮询。这里误判的代价不只是"报错": 每判错一级就真的降一级配置 ——
   # 丢掉 IPv4-only 出站(hy2 会走 v6 出去, 白送一个泄露面)、再丢掉 sniff
@@ -2768,7 +2803,7 @@ WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
   fi
-  systemctl enable sing-box >/dev/null 2>&1
+  enable_unit sing-box
   systemctl restart sing-box >/dev/null 2>&1
   # 轮询而非固定等待: 误判的代价是把本来能用的 "::" 监听换成 0.0.0.0,
   # 双栈机器上白白丢掉 IPv6。
@@ -2971,7 +3006,7 @@ ExecStop=/bin/sh -c 'iptables -t nat -D PREROUTING -p udp --dport ${start}:${end
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable hy2-hop >/dev/null 2>&1
+  enable_unit hy2-hop
   systemctl restart hy2-hop >/dev/null 2>&1
   if systemctl is-active --quiet hy2-hop; then
     ok "端口跳跃已启用: UDP ${HY2_HOP} -> ${HY2_PORT}"
@@ -3726,7 +3761,8 @@ WantedBy=timers.target
 UNIT
 
   systemctl daemon-reload
-  systemctl enable --now proxy-healthcheck.timer >/dev/null 2>&1
+  enable_unit proxy-healthcheck.timer
+  systemctl start proxy-healthcheck.timer >/dev/null 2>&1 || warn "healthcheck 定时器未能启动"
   if systemctl is-active --quiet proxy-healthcheck.timer; then
     ok "健康检查已启用(每 5 分钟, 异常自动重启)"
   else
@@ -5107,7 +5143,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable proxy-sub >/dev/null 2>&1
+  enable_unit proxy-sub
   systemctl restart proxy-sub >/dev/null 2>&1
   # python3 冷启动 + ProtectSystem=strict 的沙箱准备, 1 秒经常不够;
   # 判早了就会打印"启动失败"并给出排错指引, 而服务其实马上就起来了。
@@ -6259,7 +6295,15 @@ cmd_verify(){
     esac
     if systemctl is-active --quiet "$svc"; then
       if [ "$want" = "1" ]; then
-        printf '  %b%-10s%b %s\n' "$G" "运行中" "$N" "$svc"
+        # 进程活着不等于重启后还在: enable 失败时这里以前照样打"运行中",
+        # 用户要到下次重启才发现节点没了。没自启按失败算。
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+          printf '  %b%-10s%b %s\n' "$G" "运行中" "$N" "$svc"
+        else
+          printf '  %b%-10s%b %s  %s\n' "$Y" "未自启" "$N" "$svc" \
+            "(重启后不会自动启动, 执行 systemctl enable ${svc})"
+          bad=1
+        fi
       else
         # 配置说用不到它, 它却在跑 = 多一个对公网的监听端口。不算致命(不改退出码),
         # 但要指出正确的关闭方式: proxy restart 只重启需要的服务, 不会停多余服务。
@@ -9003,14 +9047,17 @@ menu(){
     echo -e "${M}============================================${N}"
     ui_stamp
     if load_state 2>/dev/null; then
-      local mp=""
+      local mp="" _dn=""
       proto_on reality && mp="${mp} VLESS/${VLESS_PORT}"
       proto_on hy2     && mp="${mp} HY2/${HY2_PORT}"
       proto_on ss2022  && mp="${mp} SS/${SS2022_PORT}"
       proto_on anytls  && mp="${mp} AnyTLS/${ANYTLS_PORT}"
       proto_on tuic    && mp="${mp} TUIC/${TUIC_PORT}"
       echo -e "  节点 ${G}${NODE_NAME}${N}   IP ${SERVER_IP:-?}  ${D}${mp# }${N}"
-      echo -e "  SNI  ${DEST:-?}"
+      # 菜单是最常看到的界面: 只印一个裸域名, 用户认不出 www.kernel.org 是什么站,
+      # 也没法核对 SNI 抄得对不对。dest_note 取不到(自定义域名)就只印域名。
+      _dn=$(dest_note "${DEST:-}" 2>/dev/null) || _dn=""
+      echo -e "  SNI  ${DEST:-?}${_dn:+  ${D}(${_dn})${N}}"
     else
       echo -e "  ${Y}尚未安装${N}"
     fi
@@ -9026,6 +9073,7 @@ menu(){
     echo "  l) 实时日志 (sing-box: ss2022/anytls/tuic)"
     echo "  9) 线路体检 (出口 IP / PTR / 时间 / 客户端清单)"
     echo "  n) 改节点备注名 (只改客户端显示, 不用重装)"
+    echo "  x) 伪装目标站 (当前 SNI 是什么网站 / 看全部候选)"
     echo "  v) 安全自检 (二进制指纹 / 配置 / 凭据权限)"
     echo "  d) 诊断报告 (用不了时跑这个, 凭据自动脱敏)"
     echo "  a) 设备凭据 (多设备 UUID / 单独吊销)"
@@ -9053,6 +9101,7 @@ menu(){
       l|L) cmd_logs sb ;;
       9) cmd_audit ;;
       n|N) cmd_name ;;
+      x|X) cmd_dest ;;
       v|V) cmd_verify ;;
       d|D) cmd_diag ;;
       a|A) cmd_user list ;;
@@ -9174,6 +9223,13 @@ main(){
       # 已装过的机器会进菜单, 那种不该为了查版本卡在网络上;
       # 未装过的一定会进向导, 这里提前更新, 免得向导填完才发现跑的是旧版。
       [ -f "$STATE_FILE" ] || maybe_self_update ;;
+  esac
+
+  # 只有会改系统状态的命令才需要互斥。查询类(info / dest / status / audit)不加锁:
+  # 它们不该因为别人在装而失败。
+  case "${1:-}" in
+    install|fresh|upgrade|reset|clean|uninstall|purge|update|selfupdate|restore|optimize|opt)
+      acquire_lock ;;
   esac
 
   case "${1:-}" in

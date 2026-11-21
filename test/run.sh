@@ -1607,11 +1607,97 @@ else
   fail "ensure_users_file harness 生成失败"
 fi
 
-# ---------------------------------------------------------------- 10. 行为验证脚本(mock, 不联网)
+# ---------------------------------------------------------------- 10. 服务自启 / 互斥锁 / 菜单
+say ""
+say "== 10. 服务自启 / 互斥锁 / 菜单 =="
+
+# systemctl enable 的返回值以前全被丢掉。systemd 拒绝 enable(只读 /etc、单元被
+# mask、systemd 降级)时, 装完 verify 全绿, 重启后节点静默消失 —— 而 verify 当时
+# 只查 is-active(进程现在活着), 不查 is-enabled(开机起不起), 这条路径上没有任何
+# 一处会报错。现在 enable 完立刻复查, 失败就明说该敲什么命令。
+yesno "开机自启失败会明确告警" "$(has "$CODE" '无法设置开机自启')"
+yesno "verify 会报'未自启'" "$(has "$CODE" '未自启')"
+# 闸门: 源码里不许再出现"丢掉返回值"的裸 enable。带 || true 的(systemd-timesyncd
+# 那种尽力而为的)不算 —— 它的失败不影响节点能不能用。
+bare_en=$(grep -cE '^[[:space:]]*systemctl enable [a-z0-9.-]+ >/dev/null 2>&1$' "$SRC" || true)
+yesno "没有丢弃返回值的裸 systemctl enable (剩 ${bare_en})" \
+  "$([ "${bare_en:-0}" = 0 ] && echo yes || echo no)"
+
+eu_fn=$(awk '/^enable_unit\(\)\{/,/^\}/' "$SRC")
+eu_bad=$(bash -c 'systemctl(){ case "$1" in is-enabled) return 1 ;; *) return 0 ;; esac; }
+warn(){ echo "WARN:$*"; }
+'"$eu_fn"'
+enable_unit foo.service' 2>&1)
+t "自启失败时真的告警(桩)" "$(printf '%s' "$eu_bad" | grep -c '无法设置开机自启')" "1"
+eu_ok=$(bash -c 'systemctl(){ return 0; }
+warn(){ echo "WARN:$*"; }
+'"$eu_fn"'
+enable_unit foo.service && echo QUIET' 2>&1)
+t "自启成功时不出声(桩)" "$eu_ok" "QUIET"
+
+# 并发锁: 一次安装要下三个二进制, 慢的时候几分钟, 用户很容易以为卡住再开一个窗口。
+# 两个进程各写一份 state.env(里面是 UUID 与私钥)是能把凭据写坏的。
+yesno "存在安装互斥锁" "$(has "$CODE" 'flock -n 9')"
+yesno "互斥锁只加在会改系统的命令上" \
+  "$(has "$CODE" 'install|fresh|upgrade|reset|clean|uninstall|purge|update|selfupdate|restore|optimize|opt)')"
+yesno "查询类命令不加锁" "$(no "$CODE" 'info|dest|status)  acquire_lock')"
+lock_fn=$(awk '/^acquire_lock\(\)\{/,/^\}/' "$SRC")
+# 逻辑验证, 不依赖本机是否装了 flock: 造一个假的 flock 放 PATH 最前面。
+#   退出 0 -> 必须继续往下走; 退出 1 -> 必须 die。
+# 这条在 Windows / 最小化容器里也能跑, 不会像"真 flock"那样整段被跳过。
+lkbin=$(mktemp -d 2>/dev/null) || lkbin=""
+if [ -n "$lkbin" ]; then
+  printf '#!/bin/sh\nexit 1\n' > "$lkbin/flock"; chmod +x "$lkbin/flock"
+  lk_bad=$(PATH="$lkbin:$PATH" PROXY_LOCK_FILE="$lkbin/l" bash -c '
+    '"$lock_fn"'
+    die(){ echo "DIED"; exit 1; }
+    acquire_lock
+    echo "GOT_LOCK"
+  ' 2>&1)
+  t "拿不到锁时 die(桩)" "$lk_bad" "DIED"
+  printf '#!/bin/sh\nexit 0\n' > "$lkbin/flock"
+  lk_ok=$(PATH="$lkbin:$PATH" PROXY_LOCK_FILE="$lkbin/l" bash -c '
+    '"$lock_fn"'
+    die(){ echo "DIED"; exit 1; }
+    acquire_lock
+    echo "GOT_LOCK"
+  ' 2>&1)
+  t "拿到锁时继续(桩)" "$lk_ok" "GOT_LOCK"
+  rm -rf "$lkbin"
+else
+  skip "mktemp 不可用, 跳过互斥锁桩验证"
+fi
+# 再用真 flock 验一次"别人占着锁"的情形(只有装了 flock 的机器能跑, 例如 CI)。
+if command -v flock >/dev/null 2>&1; then
+  lkdir=$(mktemp -d 2>/dev/null) || lkdir=""
+  if [ -n "$lkdir" ]; then
+    # 子进程先用另一个 fd 占住锁, 再调 acquire_lock —— 必须立刻 die, 不能排队等。
+    lk=$(PROXY_LOCK_FILE="$lkdir/l" bash -c '
+      exec 8>>"$PROXY_LOCK_FILE"
+      flock 8
+      '"$lock_fn"'
+      die(){ echo "DIED"; exit 1; }
+      acquire_lock
+      echo "GOT_LOCK"
+    ' 2>&1)
+    t "锁被别人占住时立刻失败(真 flock)" "$lk" "DIED"
+    rm -rf "$lkdir"
+  fi
+else
+  skip "flock 未安装, 跳过真锁争用验证(CI 会跑)"
+fi
+
+# 菜单是用户最常看到的界面。只印裸域名的话, 认不出 www.kernel.org 是什么站,
+# 也没法核对 SNI 抄得对不对 —— 这是"看着不安全"的真正来源。
+yesno "菜单 SNI 带站点说明" "$(has "$CODE" 'SNI  ${DEST:-?}${_dn:+')"
+yesno "菜单有伪装目标站入口" "$(has "$CODE" 'x) 伪装目标站')"
+yesno "菜单入口接到 cmd_dest" "$(has "$CODE" 'x|X) cmd_dest')"
+
+# ---------------------------------------------------------------- 11. 行为验证脚本(mock, 不联网)
 # 每个脚本登记"至少应跑多少条断言"。阈值取实际条数附近: 以前统一写 5,
 # 而真实是 8~55 条, 脚本跑到一半就退也能混过闸门。改断言数时同步这里。
 say ""
-say "== 10. 行为验证脚本 =="
+say "== 11. 行为验证脚本 =="
 for pair in \
   "xray_hash_behavior.sh:10" \
   "hy2_hash_behavior.sh:17" \
@@ -1648,7 +1734,7 @@ done
 # 整条管道判失败、-e 直接中止 —— CI 从建库起就是红的, 而且卡在第二个步骤,
 # 后面的回归套件根本没跑过。闸门本身坏了比没有闸门更糟: 它给人"有在检查"的错觉。
 say ""
-say "== 11. CI 工作流自检 =="
+say "== 12. CI 工作流自检 =="
 CIY=".github/workflows/ci.yml"
 if [ -f "$CIY" ]; then
   yesno "CI 里没有 | head 管道(SIGPIPE 会让步骤假失败)" \
