@@ -73,6 +73,31 @@ jobs:
           if printf '%s' "$out" | grep -q '世代'; then echo "version 泄露了世代字样"; exit 1; fi
           echo "OK: v${ver} (${bdate})"
 
+      # 一键命令是用户唯一的入口, 但以前从没被真跑过 —— 只被 grep 过字符串。
+      # 这里把 URL 换成 file:// 指向仓库里的 setup.sh, 落点换成 /tmp, 完整跑一遍
+      # mktemp -> curl -> bash -n -> install -> rm 这条链, 再执行一次 version
+      # 确认落盘的文件真能跑。选项拼错、install 在镜像里不存在、少写 rm 留下
+      # 临时文件, 都会在这里现形, 而不是等用户在新机器上撞。
+      - name: 一键命令链路实测
+        shell: bash
+        run: |
+          set -euo pipefail
+          before=$(ls /tmp/tmp.* 2>/dev/null | wc -l || true)
+          f=$(mktemp)
+          curl -fsSL --connect-timeout 10 -m 120 "file://$PWD/setup.sh" -o "$f"
+          bash -n "$f"
+          install -m755 "$f" /tmp/onliner-target.sh
+          rm "$f"
+          [ -x /tmp/onliner-target.sh ] || { echo "落盘文件没有执行位"; exit 1; }
+          cmp -s setup.sh /tmp/onliner-target.sh || { echo "落盘内容与源不一致"; exit 1; }
+          out=$(bash /tmp/onliner-target.sh version)
+          echo "落盘脚本可执行: ${out%%$'\n'*}"
+          rm -f /tmp/onliner-target.sh
+          # 少了 rm 那一步的话, /tmp 会多出一个 200KB 的脚本副本。
+          after=$(ls /tmp/tmp.* 2>/dev/null | wc -l || true)
+          [ "$after" -le "$before" ] || { echo "临时文件没有清掉 ($before -> $after)"; exit 1; }
+          echo "OK: 一键命令链路完整, 且没有残留临时文件"
+
       - name: 文档 / 命令生成器版本对齐
         shell: bash
         run: |
