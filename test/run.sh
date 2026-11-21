@@ -455,6 +455,16 @@ yesno "UUID 变更会打标记" "$(has "$CODE" 'CREDS_UUID_CHANGED=1')"
 yesno "users.txt 首行跟随 UUID 同步" "$(has "$CODE" 'tail -n +2 "$USERS_FILE"')"
 yesno "reset 会快照服务配置" "$(has "$CODE" '_RESET_SVC_BACKUP=')"
 yesno "restore 回滚连服务配置一起还原" "$(has "$CODE" '_reset_svc_restore')"
+# 重置会重新挑伪装站, CN 变了就重签证书, 而 state.env 里存的是旧证书的指纹。
+# 只回滚 state.env + 服务配置 = 磁盘新证书配旧指纹, 客户端握手全挂,
+# 提示却说"已自动回滚"。与修订 13 修的 restore 是同一个形态。
+yesno "reset 回滚会快照证书" \
+  "$(has "$(awk '/^_reset_svc_snapshot\(\)\{/,/^}/' "$SRC")" 'certs/hy2-cert.pem')"
+yesno "reset 回滚会还原证书" \
+  "$(has "$(awk '/^_reset_svc_restore\(\)\{/,/^}/' "$SRC")" 'certs/hy2-cert.pem')"
+yesno "reset 回滚先还原证书再重启服务" \
+  "$([ "$(awk '/^_reset_svc_restore\(\)\{/,/^}/' "$SRC" | grep -n 'certs/hy2-cert.pem\|systemctl restart' | head -1 | cut -d: -f1)" -lt \
+      "$(awk '/^_reset_svc_restore\(\)\{/,/^}/' "$SRC" | grep -n 'systemctl restart' | head -1 | cut -d: -f1)" ] && echo yes || echo no)"
 yesno "restore 回滚保留原状态副本" "$(has "$CODE" '已自动回滚到恢复前的状态')"
 yesno "设备变更后订阅生成失败会报错" "$(has "$CODE" 'if ! gen_sub_files; then')"
 yesno "设备变更后会刷新订阅服务" "$(has "$CODE" 'maybe_sub_http')"

@@ -6077,7 +6077,7 @@ cmd_verify(){
   if [ -n "$VERIFY_FIX" ]; then
     if [ "$fix" = "1" ]; then
       echo
-      local _chmod_fail=0
+      local _chmod_fail=0 a2
       while IFS='|' read -r a a2; do
         [ -n "$a" ] || continue
         if chmod "$a2" "$a" 2>/dev/null; then
@@ -7728,11 +7728,28 @@ _reset_svc_snapshot(){
   [ -f "${XRAY_CFG:-}" ] && cp -a "$XRAY_CFG" "$_RESET_SVC_BACKUP/xray.json" 2>/dev/null
   [ -f "${SB_CFG:-}" ]   && cp -a "$SB_CFG"   "$_RESET_SVC_BACKUP/singbox.json" 2>/dev/null
   [ -f "${HY2_CFG:-}" ]  && cp -a "$HY2_CFG"  "$_RESET_SVC_BACKUP/hy2.yaml" 2>/dev/null
+  # 证书也必须存。重置会重新挑伪装站, CN 一变就重签证书; 而 state.env 里的
+  # CERT_HEX / SB_PIN 是**旧**证书的指纹。只回滚 state.env 与服务配置的话,
+  # 磁盘上是新证书、旧状态里是旧指纹 —— 客户端固定的正是旧指纹, 握手全挂,
+  # 提示却说"已自动回滚"。这与修订 13 修的 restore 是同一个形态。
+  mkdir -p "$_RESET_SVC_BACKUP/certs" || return 1
+  [ -f /etc/hysteria/cert.pem ] && cp -a /etc/hysteria/cert.pem "$_RESET_SVC_BACKUP/certs/hy2-cert.pem" 2>/dev/null
+  [ -f /etc/hysteria/key.pem ]  && cp -a /etc/hysteria/key.pem  "$_RESET_SVC_BACKUP/certs/hy2-key.pem"  2>/dev/null
+  [ -f "${SB_CERT:-}" ] && cp -a "$SB_CERT" "$_RESET_SVC_BACKUP/certs/sb-cert.pem" 2>/dev/null
+  [ -f "${SB_KEY:-}" ]  && cp -a "$SB_KEY"  "$_RESET_SVC_BACKUP/certs/sb-key.pem"  2>/dev/null
   return 0
 }
 
 _reset_svc_restore(){
   [ -n "$_RESET_SVC_BACKUP" ] && [ -d "$_RESET_SVC_BACKUP" ] || return 0
+  # 先还原证书再重启服务: 服务配置与 state.env 里的指纹都指向旧证书,
+  # 顺序反过来会有一小段"新证书 + 旧指纹"的窗口。
+  if [ -d "$_RESET_SVC_BACKUP/certs" ]; then
+    [ -f "$_RESET_SVC_BACKUP/certs/hy2-cert.pem" ] && cp -a "$_RESET_SVC_BACKUP/certs/hy2-cert.pem" /etc/hysteria/cert.pem 2>/dev/null
+    [ -f "$_RESET_SVC_BACKUP/certs/hy2-key.pem" ]  && cp -a "$_RESET_SVC_BACKUP/certs/hy2-key.pem"  /etc/hysteria/key.pem  2>/dev/null
+    [ -f "$_RESET_SVC_BACKUP/certs/sb-cert.pem" ] && [ -n "${SB_CERT:-}" ] && cp -a "$_RESET_SVC_BACKUP/certs/sb-cert.pem" "$SB_CERT" 2>/dev/null
+    [ -f "$_RESET_SVC_BACKUP/certs/sb-key.pem" ]  && [ -n "${SB_KEY:-}" ]  && cp -a "$_RESET_SVC_BACKUP/certs/sb-key.pem"  "$SB_KEY"  2>/dev/null
+  fi
   if [ -f "$_RESET_SVC_BACKUP/xray.json" ] && [ -n "${XRAY_CFG:-}" ]; then
     cp -a "$_RESET_SVC_BACKUP/xray.json" "$XRAY_CFG" 2>/dev/null
     systemctl restart xray >/dev/null 2>&1
