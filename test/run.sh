@@ -511,6 +511,57 @@ fixedwait=$(awk '
 ' "$SRC")
 yesno "没有固定等待后直接判活${fixedwait:+ (行:${fixedwait})}" \
   "$([ -z "$fixedwait" ] && echo yes || echo no)"
+
+# 静态检查指令的语法。写 `# shellcheck disable=SC2086  (说明文字)` 时, 括号里
+# 那段会被当成下一个 key=value, 报 SC1125 并**整条忽略** —— 你以为屏蔽了, 其实
+# 一条都没屏蔽, 而它自己那条报错还混在 warning 噪音里没人看。这类错只有"恰好
+# 有人去读 shellcheck 输出"才会暴露, 所以单独做成闸门。
+# 注意这段注释本身不能以 `# shellcheck` 开头: 那会被当成指令去解析, 直接报
+# SC1073/SC1072 —— 这个坑我自己在这行上面又踩了一次。
+# 所以闸门同时扫 setup.sh 和本文件: 本文件里也写着指令, 一样会被静默忽略。
+bad_directive=""
+for _df in "$SRC" test/run.sh; do
+  bad_directive="${bad_directive}$(grep -nE '^[[:space:]]*#[[:space:]]*shellcheck' "$_df" \
+    | grep -vE '^[0-9]+:[[:space:]]*# shellcheck (disable=SC[0-9]+(,SC[0-9]+)*|shell=[a-z]+|source=[^[:space:]]+)$' \
+    | cut -d: -f1 | sed "s|^|${_df}:|" | tr '\n' ' ')"
+done
+yesno "shellcheck 指令语法正确${bad_directive:+ (位置:${bad_directive})}" \
+  "$([ -z "$bad_directive" ] && echo yes || echo no)"
+
+# 数组变量与全局颜色常量重名。文件顶部 R/G/Y/B/M/D/N 是颜色常量; 某个函数里写
+# `local -a B=()` 会把它在该函数内遮成数组, 之后任何 "${B}" 取到的都是数组第一个
+# 元素而不是颜色。ver_gt 里就真的这么写过 —— 只是那个函数恰好不打印颜色才没炸,
+# 而静态检查会在别处莫名报 SC2128。改名(va/vb)把隐患消掉, 这里从根上堵住。
+# 扫的是 CODE(已去掉整行注释): 否则上面这句"别写 local -a B=()"的说明自己就会被
+# 判成冲突 —— 第一版就是这么假红的。
+arrnames=$(
+  { printf '%s\n' "$CODE" | grep -oE '[A-Za-z_][A-Za-z_0-9]*=\(\)' | sed 's/=()$//'
+    printf '%s\n' "$CODE" | grep -oE 'local[[:space:]]+-a[[:space:]]+[A-Za-z_][A-Za-z_0-9]*' | awk '{print $3}'
+    printf '%s\n' "$CODE" | grep -oE 'read[[:space:]]+-[a-zA-Z]*a[a-zA-Z]*[[:space:]]+[A-Za-z_][A-Za-z_0-9]*' | awk '{print $2}'
+  } | sort -u
+)
+clash=""
+for _cv in R G Y B M D N; do
+  printf '%s\n' "$arrnames" | grep -qx "$_cv" && clash="${clash} ${_cv}"
+done
+yesno "数组变量不与颜色常量重名${clash:+ (冲突:${clash})}" \
+  "$([ -z "$clash" ] && echo yes || echo no)"
+
+# 零告警闸门。上面所有闸门都是"针对某个已知实例"的, 而静态检查覆盖的是
+# "这一整类"写法问题 —— 它以前在 CI 里是 continue-on-error 的参考项, 所以每类
+# 缺陷都只能靠人想起来去扫, 这就是"每次都能翻出旧问题"的结构性原因。
+# 本地没装就跳过(Windows 上不常见), CI 里会先装钉死版本, 缺了直接判失败。
+if command -v shellcheck >/dev/null 2>&1; then
+  if sc_out=$(shellcheck -S warning "$SRC" 2>&1); then
+    pass "shellcheck -S warning setup.sh 零告警"
+  else
+    fail "shellcheck -S warning setup.sh 有告警"
+    printf '%s\n' "$sc_out" | head -20 >&2
+  fi
+else
+  skip "shellcheck 未安装, 跳过零告警检查(CI 会装钉死版本)"
+fi
+
 yesno "egress 失败会回滚旧出口" "$(has "$CODE" 'EGRESS_URL="$old_egress"')"
 yesno "egress 端口做范围校验" "$(has "$CODE" '-gt 65535')"
 yesno "egress 探测有备用端点" "$(has "$CODE" 'for ep in https://api.ipify.org https://ifconfig.me')"
@@ -1494,6 +1545,16 @@ if [ -f "$CIY" ]; then
   yesno "CI 回归套件注入 CI=true" "$(has "$(cat "$CIY")" 'CI: "true"')"
   yesno "CI 有 LF 闸门" "$(has "$(cat "$CIY")" "printf '\\r'")"
   yesno "CI 有敏感信息扫描" "$(has "$(cat "$CIY")" 'BEGIN [A-Z ]*PRIVATE KEY')"
+  # 静态检查以前是 continue-on-error 的"参考项", 等于没有闸门 —— 每一类写法
+  # 问题都只能靠人想起来去扫, 这就是"每次都能翻出旧问题"的结构性原因。
+  # 现在它是硬闸门, 这里守住"别被降级回去": 出现 continue-on-error 或"参考项"
+  # 字样就判失败。
+  # 只认 YAML 键(`continue-on-error:` 顶格或缩进开头), 不认注释里提到的字样 ——
+  # 否则上面那段说明"以前是 continue-on-error"的注释自己就会把闸门打红。
+  yesno "CI 的 shellcheck 是硬闸门(没有 continue-on-error)" \
+    "$([ "$(grep -cE '^[[:space:]]*continue-on-error:' "$CIY")" = 0 ] && echo yes || echo no)"
+  yesno "CI 装了 shellcheck 并钉死版本" "$(has "$(cat "$CIY")" 'shellcheck-${SC_VER}.linux.x86_64.tar.xz')"
+  yesno "CI 断言 shellcheck 版本没漂移" "$(has "$(cat "$CIY")" 'shellcheck 版本漂移')"
 else
   fail "缺少 CI 工作流文件 $CIY"
 fi

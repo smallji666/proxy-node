@@ -210,7 +210,12 @@ valid_domain(){
     # *. 不能漏: IFS=. 循环会吞掉尾部空字段, "a.com." 只会被切成 a / com,
     # 光靠逐段检查拦不住末尾的点。带尾点的绝对域名当 SNI / 证书 CN 会与
     # 客户端实际发的 SNI 对不上, REALITY 握手直接失败。
-    *[!A-Za-z0-9.-]*|*'..'*|.*|*.|*-|*.-|*-.) return 1 ;;
+    # 模式顺序有讲究, 后面两个已被前面覆盖, 不再重复写:
+    #   *-   已覆盖 *.-  (都以 - 结尾)
+    #   *.   已覆盖 *-.  (都以 . 结尾)
+    # 写成 `*-|*.-` 时 shellcheck 会报 SC2221/SC2222 —— 那不是误报, 是真的有
+    # 两条永远匹配不到的模式, 留着只会让人以为多拦了一种情况。
+    *[!A-Za-z0-9.-]*|*'..'*|.*|*.|*-) return 1 ;;
   esac
   # 每段都要有内容、不以 - 开头结尾
   local seg
@@ -1767,6 +1772,10 @@ pick_dest(){
   # 没有这个取值的话, 已装好的机器想换 SNI 只能点名指定某个站, 没法随机。
   [ -n "$REALITY_DEST" ] && [ "$REALITY_DEST" != "random" ] && cands+=("$REALITY_DEST")
   # 只用国内能直连的站: dest 若被墙, 用户发 SNI 时就先被 GFW 拦了, 根本到不了握手
+  # REALITY_DESTS 是空格分隔的硬编码域名常量, 不含通配符, 这里的 word splitting
+  # 就是取用方式。不用 `read -ra` 拆一次数组: 那样这个常量在两处的取用形式会
+  # 不一致(一处数组一处字符串), 反而更容易被下次改坏。
+  # shellcheck disable=SC2206
   cands+=($REALITY_DESTS)
 
   info "挑选伪装目标站(按 TLS 版本分档、档内测握手耗时, 需通过真实 REALITY 握手)..."
@@ -1823,7 +1832,7 @@ pick_dest(){
     done < <(shuffle_words ${top[@]+"${top[@]}"})
     # 前三名真实握手都失败时, 按耗时顺序补上本档剩下的 —— 不能因为"没被随机到"
     # 就丢掉一个 TLS1.3 的站, 转头去试 TLS1.2 的
-    for line in ${grp[@]:3}; do
+    for line in "${grp[@]:3}"; do
       [ "${line%%|*}" = "$pin" ] && continue
       order+=("$line")
     done
@@ -2629,6 +2638,11 @@ UNIT
 #   整证书 SHA-256 (hex)    -> hysteria2 URI / 配置里的 pinSHA256; mihomo 的 fingerprint
 #                              已用 `hysteria cert` 的输出核对过, 就是整证书 DER 的 hex
 #   SPKI 公钥 SHA-256 (b64) -> sing-box 的 certificate_public_key_sha256
+# 脚本里不带参调用(默认就是 hysteria 证书), 但测试会传一张临时证书进来做独立
+# 复算 —— 参数是给测试留的, 所以 SC2120 在这里是误报。
+# 指令必须紧贴命令且后面不跟文字: 写成 `disable=SC2120  (说明)` 时 shellcheck
+# 会把括号里那段当成下一个 key=value, 报 SC1125 并**整条忽略掉**。
+# shellcheck disable=SC2120
 compute_cert_pins(){
   # $1 可选, 默认就是 hysteria2 的证书路径。做成参数是为了能被回归套件
   # 用一张临时证书直接验证 —— 否则这段唯一的算法只能靠肉眼审。
@@ -2741,7 +2755,10 @@ hop_cleanup_rules(){
       *) continue ;;
     esac
     spec="${line#-A }"
-    # shellcheck disable=SC2086  (iptables -S 的输出本来就是按空格分好的参数)
+    # $spec 是 `iptables -S` 的输出, 本来就是按空格分好的参数串, 这里必须让
+    # word splitting 生效 —— 加引号会把整串当成一个参数传给 iptables。
+    # 指令后面不能跟文字, 否则 shellcheck 报 SC1125 并整条忽略(等于没屏蔽)。
+    # shellcheck disable=SC2086
     iptables -t nat -D $spec >/dev/null 2>&1 && n=$((n + 1))
   done < <(iptables -t nat -S 2>/dev/null | grep '^-A PREROUTING ' || true)
   [ "$n" -gt 0 ] && ok "已清理 ${n} 条旧的端口跳跃 REDIRECT 规则"
@@ -3048,7 +3065,9 @@ detect_exit_tz(){
     # 再被 ln -sf 写进 /etc/localtime —— 等于拿系统文件当符号链接目标。
     case "$cand" in
       */*) case "$cand" in
-             *.*|*..*|*//*|/*|*' '*|*[!A-Za-z0-9_+-/]*) ;;
+             # *.* 已经涵盖 *..* (含两个点必然含一个点), 不必再写一条永远
+             # 匹配不到的模式。
+             *.*|*//*|/*|*' '*|*[!A-Za-z0-9_+-/]*) ;;
              *) tz="$cand"; break ;;
            esac ;;
     esac
@@ -3284,9 +3303,13 @@ TZL
 
 # 二级菜单: 选组里的某一项
 tz_pick(){
-  local grp="$1" title="$2" i sel line
+  # 变量名带 tz_ 前缀, 别叫 grp: pick_dest 里的 grp 是**数组**, 这里的是字符串。
+  # 两处都 local 所以不会真的串, 但同名不同类型正是"复制代码就变真 bug"的形态,
+  # 静态检查也会一直报 SC2178/SC2128 —— 那是它没法做作用域推断, 不是误报本身
+  # 有问题。改名把这个隐患直接消掉。
+  local tz_grp="$1" title="$2" i sel line
   local -a items=()
-  while IFS= read -r line; do [ -n "$line" ] && items+=("$line"); done < <(tz_group "$grp")
+  while IFS= read -r line; do [ -n "$line" ] && items+=("$line"); done < <(tz_group "$tz_grp")
   [ ${#items[@]} -gt 0 ] || return 1
   while true; do
     echo
@@ -7894,12 +7917,16 @@ fetch_remote_version(){
 
 # 版本比较: 远端比本地新返回 0。只比 x.y.z 三段数字, 脏版本号当 0 处理。
 ver_gt(){
+  # 变量名别用 A / B: 文件顶部 B 是全局的青色(\033[0;36m), 这里 `local -a B=()`
+  # 会把颜色变量在这个函数里遮成数组。现在函数内没用到颜色所以没炸, 但这是
+  # "复制代码就变真 bug"的形态 —— 静态检查也一直在 ${B} 处报 SC2128。
+  # 改名把这个隐患直接消掉。
   local i x y
-  local -a A=() B=()
-  IFS=. read -r -a A <<< "${1:-}"
-  IFS=. read -r -a B <<< "${2:-}"
+  local -a va=() vb=()
+  IFS=. read -r -a va <<< "${1:-}"
+  IFS=. read -r -a vb <<< "${2:-}"
   for i in 0 1 2; do
-    x="${A[$i]:-0}"; y="${B[$i]:-0}"
+    x="${va[$i]:-0}"; y="${vb[$i]:-0}"
     case "$x" in ''|*[!0-9]*) x=0 ;; esac
     case "$y" in ''|*[!0-9]*) y=0 ;; esac
     [ "$x" -gt "$y" ] && return 0
@@ -7945,7 +7972,7 @@ ui_stamp(){
 #   3) 不是当前正在运行的那一份
 # 软链不碰: 指向当前文件的要保留, 指向别处的由安装流程重新指向。
 cleanup_stale_scripts(){
-  local self c rp n=0 cv ce
+  local self c rp n=0 cv
   self=$(running_script_path)
   [ -n "$self" ] || return 0
   self=$(readlink -f "$self" 2>/dev/null || printf '%s' "$self")
@@ -8381,7 +8408,7 @@ residue_report(){
 # $1: 1=状态文件可读(正常安装过) 0=状态缺失
 # 返回 0=直接继续, 1=已清理(调用方要重置内存凭据并按全新安装处理)
 install_clean_gate(){
-  local state_ok="${1:-0}" items=""
+  local state_ok="${1:-0}" residue=""
 
   if [ "$CLEAN" = "1" ]; then
     info "CLEAN=1 / --clean: 先清理旧实例再安装"
@@ -8407,12 +8434,12 @@ install_clean_gate(){
   fi
 
   # 状态缺失但有残留文件 = 上次装到一半的残缺安装, 不清理必然端口冲突
-  items=$(residue_report) || return 0
+  residue=$(residue_report) || return 0
 
   if [ "$ours" != "1" ]; then
     echo
     warn "机器上已有 xray / hysteria / sing-box, 但没有本脚本的安装标记:"
-    printf '%s' "$items"
+    printf '%s' "$residue"
     warn "这些不是本脚本装的, 不会自动清理(删掉别人的节点是不可逆的)"
     warn "若端口冲突, 先自行停用它们, 或换端口安装:"
     echo -e "    ${D}VLESS_PORT=8443 HY2_PORT=8443 bash /root/setup-proxy.sh install${N}"
@@ -8421,7 +8448,7 @@ install_clean_gate(){
 
   echo
   warn "检测到残缺安装的残留文件:"
-  printf '%s' "$items"
+  printf '%s' "$residue"
   echo
   echo -e "${D}  这些是上次安装中断留下的, 不清理会占端口导致新配置起不来。${N}"
 

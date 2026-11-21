@@ -141,6 +141,24 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} != v${ver}"; exit 1; }
           echo "OK: tag ${GITHUB_REF_NAME} == v${ver}"
 
+      # 装钉死版本的 shellcheck。不用 apt 的 shellcheck: runner 镜像换一版就换一套
+      # 检查规则, 同一份代码今天绿明天红(或者反过来, 新规则加了却没人知道)。
+      # 版本钉死之后, "零告警"才是一个可复现的结论, 而不是随镜像漂移的运气。
+      # 放在回归套件之前: 套件里也有一条"shellcheck 零告警"的闸门, 它依赖这个步骤。
+      - name: 安装 shellcheck (钉死版本)
+        shell: bash
+        env:
+          SC_VER: v0.10.0
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/${SC_VER}/shellcheck-${SC_VER}.linux.x86_64.tar.xz"
+          curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 -o /tmp/sc.tar.xz "$url"
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-${SC_VER}/shellcheck" /usr/local/bin/shellcheck
+          got=$(shellcheck --version | sed -n 's/^version: //p')
+          [ "$got" = "${SC_VER#v}" ] || { echo "shellcheck 版本漂移: 装到 $got, 期望 ${SC_VER#v}"; exit 1; }
+          echo "OK: shellcheck $got"
+
       # CI=true 会让回归套件里的 skip() 直接判 FAIL; 这一层再兜一次 SKIP 字样,
       # 防止以后有人新加一段 say "SKIP ..." 又把闸门绕过去。
       - name: 回归套件 (CI 下 SKIP = 失败)
@@ -197,11 +215,14 @@ jobs:
           fi
           echo "OK: 无空白错误 / 冲突标记"
 
-      - name: shellcheck (参考项, 不计入闸门)
-        continue-on-error: true
+      # 这一条以前是 `continue-on-error: true` 的"参考项, 不计入闸门"。
+      # 那正是"每次都能翻出旧问题"的结构性原因: 上面每一条闸门都是针对某个已知
+      # 实例的, 而这一类写法问题没有任何东西在持续兜底 —— 修完一类只是多了一条
+      # 针对那个实例的断言, 下一类只能靠人想起来去扫。
+      # 现在它是硬闸门: 一条 warning 就等于回归失败。
+      - name: shellcheck 硬闸门 (零 warning)
         shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning setup.sh setup-proxy.sh test/run.sh || \
-            echo "shellcheck 有提示, 仅供参考 —— 硬闸门是上面的回归套件"
+          set -euo pipefail
+          shellcheck -S warning setup.sh setup-proxy.sh test/run.sh
+          echo "OK: 三个脚本在 -S warning 下零告警"
