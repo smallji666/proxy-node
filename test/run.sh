@@ -249,8 +249,53 @@ yesno "指纹写进 sing-box 订阅" "$(has "$CODE" '"fingerprint": "${REALITY_F
 yesno "指纹非法回退 chrome" "$(has "$CODE" '不是 Xray 认识的指纹, 已回退 chrome')"
 yesno "伪装站池统一常量" "$(has "$CODE" 'REALITY_DESTS="www.samsung.com')"
 yesno "两处挑选共用池子" "$(has "$CODE" 'cands+=($REALITY_DESTS)')"
-yesno "池子含冷门技术站" "$(has "$CODE" 'www.kernel.org www.debian.org www.suse.com')"
+yesno "池子含冷门技术站" "$(has "$CODE" 'www.kernel.org www.debian.org www.apache.org')"
 yesno "池子与黑名单无 google" "$(no "$CODE" 'REALITY_DESTS="www.google.com')"
+# 池子规模下限。20 个的时候, 档位 1 只有十几个合格站, 而"每档取最快 3 个随机"
+# 让实际只有 3 种可能值 —— 全网几十万台机器集中在这 3 个域名上, 统计"哪些机房
+# IP 在跟这三个站握手"照样能整段捞出来。
+# 下限 30: 30 个 -> 档位 1 约 25 个 -> 取前 8 -> 8 种可能, 再往上加收益就很小了
+# (分散度由"每档取 N"决定, 不由池子大小决定), 反而让安装时多探一堆站。
+# 上限 40 是防止有人又往池子里堆流量掩护弱的站 —— 数量不是质量。
+dest_n=$(bash -c 'eval "$(grep -m1 "^REALITY_DESTS=" setup.sh)"; set -- $REALITY_DESTS; echo $#' 2>/dev/null)
+yesno "伪装站池在 25~35 个之间(当前 ${dest_n})" \
+  "$([ -n "$dest_n" ] && [ "$dest_n" -ge 25 ] && [ "$dest_n" -le 35 ] && echo yes || echo no)"
+# 每档取样数必须随档内数量浮动。写死 3 的话池子扩到多少都白扩。
+yesno "每档随机数随档内数量浮动" "$(has "$CODE" 'n_rand=$(( ${#grp[@]} / 3 ))')"
+yesno "每档随机数上限 8" "$(has "$CODE" '[ "$n_rand" -gt 8 ] && n_rand=8')"
+# 一个候选站只握手一次。以前拆成"查 CF"+"查版本"两个函数各跑一次 openssl
+# s_client —— 同一个握手跑两遍, 池子一扩这个浪费就乘上去。
+yesno "候选站探测只握手一次" "$(has "$CODE" 'read -r pv pa pi <<< "$(dest_probe "$d")"')"
+yesno "CF 检测走独立函数(不再只看证书)" "$(has "$CODE" 'dest_behind_cf(){')"
+# CF 现在的边缘证书由 Google Trust Services 签发(实测 www.cloudflare.com 的 issuer
+# 就是 GTS), 证书里没有 "Cloudflare" 字样 —— 只查 issuer 会整片漏掉套 CF 的站。
+# 必须同时看响应头。实测池子里 suse/redis/w3/nodejs 四个都是 CF, 老逻辑一个都没拦。
+yesno "CF 检测看响应头不只查证书" "$(has "$CODE" 'server:[[:space:]]*cloudflare|cf-ray:')"
+yesno "CF 检测也认 cf-ray" "$(has "$CODE" 'cf-ray:')"
+# 行为验证(用桩, 不联网): 只查"字符串在不在"证明不了逻辑对 —— 这次的漏洞正是
+# "代码在, 但判据不覆盖真实情况"(只看 issuer, 而 CF 的边缘证书由 GTS 签发)。
+# 这里把 curl 换成固定返回的桩, 真的调一次 dest_behind_cf 看判定结果。
+cf_fn=$(awk '/^dest_behind_cf\(\)\{/,/^\}/' "$SRC")
+cf_hit=$(bash -c 'curl(){ printf "HTTP/1.1 200 OK\r\nserver: cloudflare\r\ncf-ray: 1\r\n\r\n"; }
+'"$cf_fn"'
+dest_behind_cf example.com "" && echo CF || echo NO' 2>/dev/null)
+t "CF 响应头被识别(桩)" "$cf_hit" "CF"
+cf_ray=$(bash -c 'curl(){ printf "HTTP/1.1 200 OK\r\ncf-ray: 8a1b2c\r\n\r\n"; }
+'"$cf_fn"'
+dest_behind_cf example.com "" && echo CF || echo NO' 2>/dev/null)
+t "只有 cf-ray 也被识别(桩)" "$cf_ray" "CF"
+cf_miss=$(bash -c 'curl(){ printf "HTTP/1.1 200 OK\r\nserver: nginx\r\n\r\n"; }
+'"$cf_fn"'
+dest_behind_cf example.com "" && echo CF || echo NO' 2>/dev/null)
+t "普通响应头被放过(桩)" "$cf_miss" "NO"
+cf_iss=$(bash -c 'curl(){ :; }
+'"$cf_fn"'
+dest_behind_cf example.com "issuer=O=Cloudflare, Inc." && echo CF || echo NO' 2>/dev/null)
+t "证书 issuer 命中(桩)" "$cf_iss" "CF"
+cf_none=$(bash -c 'curl(){ :; }
+'"$cf_fn"'
+dest_behind_cf example.com "issuer=O=Google Trust Services, CN=WE1" && echo CF || echo NO' 2>/dev/null)
+t "GTS 签发但无 CF 头时放过(桩)" "$cf_none" "NO"
 yesno "client-guide 有 Reality 专属排障" "$(has "$(cat "$SRC")" 'Reality 单独连不上、Hysteria2 却能用')"
 yesno "README 有 Reality 专属 FAQ" "$(has "$(cat README.md)" 'Reality 连不上、HY2 能用')"
 yesno "README 有 REALITY_FP 变量" "$(has "$(cat README.md)" '| `REALITY_FP` | `chrome` |')"
@@ -332,7 +377,7 @@ fi
 # 假绿根源: mock 没真拦到官方 URL, 镜像兜底分支从未执行
 # dest_rank 的 stdout 是选站数据, 4 条 warn 都不许混进去
 yesno "dest_rank 排除名单警告走 stderr" "$(has "$CODE" 'warn "$d 在排除名单(被墙域名/CDN 共用证书链), 跳过" >&2')"
-yesno "dest_rank CF 警告走 stderr" "$(has "$CODE" 'TLS 行为不稳定, 跳过" >&2')"
+yesno "dest_rank CF 警告走 stderr" "$(has "$CODE" '套了 Cloudflare(响应头 server/cf-ray 或证书), 跳过" >&2')"
 yesno "dest_rank 弱 TLS 警告走 stderr" "$(has "$CODE" '抗主动探测略弱, 列为备选" >&2')"
 yesno "dest_rank 探测失败警告走 stderr" "$(has "$CODE" '交给真实握手判定" >&2')"
 # restore 失败回滚必须连证书一起还原

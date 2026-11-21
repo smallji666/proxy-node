@@ -1647,13 +1647,41 @@ verify_reality(){
 # 避免历史上"一处加了站另一处没加"的漂移。
 # 挑选标准(Xray 官方 REALITY 文档): 国外站、TLSv1.3 + H2、非跳转域名、国内可直连。
 # 2026-11-17 从本机实测 TLS/ALPN: 下面全部是 TLSv1.3 + h2。
-# 热门大站打头(bing 实测只有 TLSv1.2, 排在档位2, 但保留给用户手动指定);
-# 后面补一批冷门技术站 —— 官方说"目标 IP 冷门更好": SNI 集中在少数热门站、
-# 而 IP 的 ASN 又不属于那家公司, 是最容易被批量识别的特征。
-REALITY_DESTS="www.samsung.com www.nvidia.com www.amd.com www.ibm.com www.tesla.com www.adobe.com www.oracle.com www.dell.com www.hp.com www.intel.com www.mozilla.org www.python.org www.kernel.org www.debian.org www.suse.com www.apache.org www.nginx.com www.postgresql.org www.mysql.com www.bing.com"
+# REALITY 的伪装目标池。四个硬条件, 缺一不可:
+#   1) 国内能直连 —— dest 若被墙, 用户发 SNI 的那一刻就先被拦了, 握手根本到不了 VPS
+#   2) TLS 1.3 + ALPN h2 —— REALITY 的硬要求, 少 h2 的站和浏览器指纹对不上
+#   3) 不是"教程标配" —— 判据不是"这个站常不常见", 而是"跟它握手的 IP 里代理占多大
+#      比例"。www.microsoft.com / www.apple.com 本身完全合格(实测都是 TLS1.3, 证书由
+#      自家 CA 签发, SAN 只有 2~7 个域名, 并不存在"证书链大规模共用"), 但几乎所有
+#      REALITY 教程都写这两个 —— 全网几十万节点集中在同一个 SNI 上, 这个 SNI 本身
+#      就变成了指纹。同理排掉 Cloudflare 系(边缘证书由 Google Trust Services 签发,
+#      且 CF 的 IP 段被大量代理占用)和 Google 系(国内直接不可达)。
+#      反过来说太冷门也不行: 一个没人访问的站, 你的 VPS 天天跟它握手反而更显眼。
+#      要的是"大站, 但教程不推荐"。
+#   4) 稳定、不敏感 —— 小站今天在线明天关站, 你的节点就跟着废了
+#
+# 加站之前先对照这四条。加进来之后 dest_rank 会在安装时自动复核: 探不到 TLS 1.3
+# 的降档, 真实握手失败的跳过 —— 所以就算某个站临时挂了也不会让安装失败, 只是多花
+# 几秒探测时间(合并握手后一个不可达站只等 5 秒, 见 dest_probe)。
+#
+# 为什么不用排行榜动态拉: 安装时必须能离线工作。拉列表这一步一旦要联网, 被墙时
+# 就装不下去了 —— 而"被墙"正是用户来装这个的原因。
+#
+# 规模: 28 个, 不再往上堆。判断标准是"每个都要有真实流量掩护", 不是"越多越分散":
+# 池子只决定"能分散到什么程度", 真正的分散度是 pick_dest 里"每档取前 N 随机"的 N。
+# 池子 28 个 -> 档位 1 约 22 个 -> 取前 7 -> 7 种可能, 和池子 48 个的效果几乎一样,
+# 但安装时少探 20 个站。砍掉的都是流量掩护弱的: 标准组织(ietf / unicode)、
+# 开发者小众站(rust-lang / go.dev)、地区性品牌(acer / philips)、TLS 只到 1.2 的(bing),
+# 以及**套了 Cloudflare 的**(suse / redis / w3 / nodejs) —— 见下面 dest_behind_cf。
+REALITY_DESTS="www.samsung.com www.nvidia.com www.amd.com www.intel.com www.dell.com www.hp.com www.lenovo.com www.asus.com www.sony.com www.ibm.com www.oracle.com www.sap.com www.adobe.com www.autodesk.com www.mathworks.com www.wolfram.com www.mozilla.org www.python.org www.kernel.org www.debian.org www.apache.org www.nginx.com www.postgresql.org www.mysql.com www.mongodb.com www.elastic.co www.ubuntu.com www.fedoraproject.org"
 # 黑名单: 实测不能用作 REALITY 伪装目标
 # Google 系不能当 dest: 这些域名在国内本身就是被墙的, 正常中国用户不会主动连,
-# GFW 看到 SNI=dl.google.com 反而更容易把连接挑出来。apple/cloudflare 是 CDN 共用证书链。
+# GFW 看到 SNI=dl.google.com 反而更容易把连接挑出来。
+# apple / microsoft 不是"不合格"(实测 TLS1.3、自家 CA、SAN 只有 2~7 个域名), 而是
+# "被教程用烂了": 几乎所有 REALITY 教程都写这两个, 全网几十万节点压在同一个 SNI 上,
+# 它本身就成了指纹。理由写准确, 免得下次有人照着"CDN 共用证书链"去验证, 验不过
+# 就把这条删掉。
+# Cloudflare 系: 边缘证书由 Google Trust Services 签发, 且 CF 的 IP 段被大量代理占用。
 BLOCKED_DESTS="www.cloudflare.com cloudflare.com 1.1.1.1 www.apple.com apple.com www.icloud.com icloud.com www.microsoft.com microsoft.com dl.google.com www.google.com google.com www.youtube.com youtube.com"
 is_blocked(){
   local d="$1" b
@@ -1666,14 +1694,45 @@ is_blocked(){
 # 混在一起会被页面里满地的 google.com 链接带偏。
 GOOGLE_TLD_RE='(https?://)?(www\.)?google\.(com\.hk|com\.tw|com\.sg|com\.my|com\.ph|com\.vn|com\.br|com\.mx|com\.ar|com\.au|com\.tr|com\.sa|co\.jp|co\.kr|co\.uk|co\.in|co\.nz|co\.za|co\.th|co\.id|co\.il|cn|de|fr|nl|it|es|ru|pl|se|no|dk|fi|ch|at|be|cz|ie|ae|ca|cl)[/"]'
 
-# 检测目标站是否套在 Cloudflare 后面(看证书签发者)
-# 用于拦住"用户把自己套了 CF 的域名填进来"这种情况
-dest_behind_cloudflare(){
-  local d="$1" issuer
-  issuer=$(timeout 8 openssl s_client -connect "${d}:443" -servername "$d" </dev/null 2>/dev/null \
-           | openssl x509 -noout -issuer 2>/dev/null)
-  [ -n "$issuer" ] || return 1
-  echo "$issuer" | grep -qi "cloudflare"
+# 判断目标站是不是套在 Cloudflare 后面。两个判据, 命中任一即算:
+#   1) 证书 issuer 里带 Cloudflare —— 只覆盖 CF 自己的 CA, 现在已很少见
+#   2) 响应头里有 server: cloudflare 或 cf-ray —— CF 边缘加的, 源站改不掉
+#
+# 为什么必须加第 2 条: CF 现在的 Universal SSL 边缘证书由 Google Trust Services
+# 签发(实测 www.cloudflare.com 的 issuer 就是 "O=Google Trust Services, CN=WE1"),
+# 证书里根本没有 "Cloudflare" 字样。只查 issuer 会**整片漏掉**套 CF 的站 ——
+# 实测池子里 suse / redis / w3 / nodejs 四个都是 CF, 一个都没被拦下来。
+#
+# 为什么必须拦: CF 的 IP 段被大量代理和 VPN 占用, 是全网最"可疑"的一批地址。
+# 拿 CF 站当 SNI, 等于主动把连接混进最容易被整体标记的那一堆里 —— 这是 REALITY
+# 选目标站时最该避开的一类, 比"站够不够大"重要得多。
+dest_behind_cf(){
+  local d="$1" issuer="$2" h
+  case "$issuer" in *[Cc]loudflare*) return 0 ;; esac
+  h=$(curl -sI --max-time 5 "https://$d/" 2>/dev/null | tr -d '\r')
+  [ -n "$h" ] || return 1
+  printf '%s' "$h" | grep -qiE '^(server:[[:space:]]*cloudflare|cf-ray:)'
+}
+# 一次 TLS 握手同时拿三样: 协商版本、ALPN、证书签发者。
+# 以前拆成 dest_behind_cloudflare + dest_tls_info 两个函数, 各跑一次
+# `openssl s_client` —— 同一个站的同一个握手跑两遍, 每个候选白多一次往返。
+# 候选池扩到 28 个之后这个浪费会直接乘上去: 一个不可达的站原来要白等
+# 16 秒(两次 8s 超时), 合并后只要 5 秒。
+# 超时从 8s 收到 5s: TLS 握手 5 秒还没完成, 这个站当回落目标也已经没意义了,
+# 留着只会让"挑选伪装站"这一步转得更久。
+dest_probe(){
+  local d="$1" f v a i
+  f=$(mktemp 2>/dev/null) || { printf 'none|none|'; return 0; }
+  timeout 5 openssl s_client -connect "${d}:443" -servername "$d" -alpn h2 </dev/null >"$f" 2>/dev/null
+  v=$(grep -a -m1 -E '^[[:space:]]*Protocol[[:space:]]*:' "$f" 2>/dev/null \
+      | sed 's/^[[:space:]]*Protocol[[:space:]]*:[[:space:]]*//' | tr -d '\r')
+  a=$(grep -a -m1 'ALPN protocol:' "$f" 2>/dev/null \
+      | sed 's/.*ALPN protocol:[[:space:]]*//' | tr -d '\r')
+  # 套了 Cloudflare 的站证书由 CF 签发。这类站的证书链是全站共用的,
+  # 拿它当 SNI 反而更容易被识别 —— 所以要单独判出来。
+  i=$(openssl x509 -noout -issuer <"$f" 2>/dev/null)
+  rm -f "$f"
+  printf '%s|%s|%s' "${v:-none}" "${a:-none}" "$i"
 }
 
 # 探测目标站的 TLS 版本与 ALPN, 输出 "TLSv1.3|h2" / "TLSv1.2|h2" / "none|none"。
@@ -1686,16 +1745,13 @@ dest_behind_cloudflare(){
 #    只有 SSL-Session 段里缩进的 "    Protocol  : TLSv1.3" (冒号前还有两个空格)。
 #    所以既不能锚定行首, 也不能按 "Protocol:" 去 sed, 否则老系统上永远读到空值,
 #    表现就是所有候选站都被判成 "不可达或不支持 H2(none|h2)" 而全部跳过。
+# 只取"版本|ALPN"两段, 给 proxy audit 显示用。
+# 解析逻辑与 dest_probe 共用一份: 以前两处各写一套 grep/sed, 改一处忘另一处
+# 就会出现"audit 显示的和挑选时判定的不一致"这种最难查的漂移。
 dest_tls_info(){
-  local d="$1" f v a
-  f=$(mktemp 2>/dev/null) || { printf 'none|none'; return 0; }
-  timeout 8 openssl s_client -connect "${d}:443" -servername "$d" -alpn h2 </dev/null >"$f" 2>/dev/null
-  v=$(grep -a -m1 -E '^[[:space:]]*Protocol[[:space:]]*:' "$f" 2>/dev/null \
-      | sed 's/^[[:space:]]*Protocol[[:space:]]*:[[:space:]]*//' | tr -d '\r')
-  a=$(grep -a -m1 'ALPN protocol:' "$f" 2>/dev/null \
-      | sed 's/.*ALPN protocol:[[:space:]]*//' | tr -d '\r')
-  rm -f "$f"
-  printf '%s|%s' "${v:-none}" "${a:-none}"
+  local p
+  p=$(dest_probe "$1")
+  printf '%s|%s' "${p%%|*}" "$(printf '%s' "$p" | cut -d'|' -f2)"
 }
 
 # TLS 握手耗时(毫秒), 用来在同一档候选里排序。
@@ -1728,7 +1784,7 @@ dest_rtt(){
 # REALITY 握手。之前把探测失败当淘汰条件, 结果 openssl 3.0 上读不到版本号,
 # 11 个候选站全被跳过, 安装直接死在"所有目标站握手失败"。
 dest_rank(){
-  local d info_t tier rtt
+  local d info_t tier rtt pv pa pi
   local -a rows=() tiers=() names=()
   local seen="|" have_good=0 i
   for d in "$@"; do
@@ -1737,8 +1793,11 @@ dest_rank(){
     case "$seen" in *"|${d}|"*) continue ;; esac
     seen="${seen}${d}|"
     is_blocked "$d" && { warn "$d 在排除名单(被墙域名/CDN 共用证书链), 跳过" >&2; continue; }
-    dest_behind_cloudflare "$d" && { warn "$d 证书由 Cloudflare 签发(站点套了 CF), TLS 行为不稳定, 跳过" >&2; continue; }
-    info_t=$(dest_tls_info "$d")
+    # 一次握手拿全三样(版本/ALPN/签发者), 见 dest_probe 的说明。
+    IFS='|' read -r pv pa pi <<< "$(dest_probe "$d")"
+    dest_behind_cf "$d" "$pi" && {
+      warn "$d 套了 Cloudflare(响应头 server/cf-ray 或证书), 跳过" >&2; continue; }
+    info_t="${pv}|${pa}"
     case "$info_t" in
       "TLSv1.3|h2") tier=1 ;;
       *\|h2)        tier=2; warn "$d 只有 ${info_t}, 抗主动探测略弱, 列为备选" >&2 ;;
@@ -1826,7 +1885,7 @@ pick_dest(){
   fi
 
   local -a order=() sorted=() grp=() top=()
-  local line t2 r2 d2 item tier
+  local line t2 r2 d2 item tier n_rand
   [ -n "$pin" ] && order+=("${pin}|?")
   while IFS= read -r line; do [ -n "$line" ] && sorted+=("$line"); done \
     < <(dest_rank "${cands[@]}")
@@ -1837,16 +1896,25 @@ pick_dest(){
       [ "$t2" = "$tier" ] && grp+=("${d2}|${r2}")
     done
     [ "${#grp[@]}" -gt 0 ] || continue
-    # 只把本档最快的 3 个拿出来随机
-    top=("${grp[@]:0:3}")
+    # 每档取最快的 N 个来随机, N 随档内数量走: 档里站越多, 能分散的余地越大。
+    #
+    # 这里原来写死 3。池子扩到 40+ 之后问题就露出来了: 档位 1 有二十多个合格的
+    # TLS1.3 站, 却只从最快的 3 个里随机 —— 等于白扩, 全网几十万台机器还是集中
+    # 在那 3 个域名上, 统计"哪些机房 IP 在跟这三个站握手"照样能整段捞出来。
+    #
+    # 上限 8: 再多只是"看起来更分散", 而每个候选都要真握手一次, 试错成本在涨。
+    n_rand=$(( ${#grp[@]} / 3 ))
+    [ "$n_rand" -lt 3 ] && n_rand=3
+    [ "$n_rand" -gt 8 ] && n_rand=8
+    top=("${grp[@]:0:$n_rand}")
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       [ "${line%%|*}" = "$pin" ] && continue
       order+=("$line")
     done < <(shuffle_words ${top[@]+"${top[@]}"})
-    # 前三名真实握手都失败时, 按耗时顺序补上本档剩下的 —— 不能因为"没被随机到"
-    # 就丢掉一个 TLS1.3 的站, 转头去试 TLS1.2 的
-    for line in "${grp[@]:3}"; do
+    # 随机到的这几个真实握手都失败时, 按耗时顺序补上本档剩下的 —— 不能因为
+    # "没被随机到"就丢掉一个 TLS1.3 的站, 转头去试 TLS1.2 的
+    for line in "${grp[@]:$n_rand}"; do
       [ "${line%%|*}" = "$pin" ] && continue
       order+=("$line")
     done
