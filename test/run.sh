@@ -285,7 +285,11 @@ for d in "$@"; do dest_note "$d" >/dev/null 2>&1 || printf "%s " "$d"; done
 ' _ "$note_fn" $dest_list 2>/dev/null)
 yesno "池子里每个站都有 dest_note 说明${note_missing:+ (缺: ${note_missing})}" \
   "$([ -n "$note_fn" ] && [ -z "$note_missing" ] && echo yes || echo no)"
-yesno "info 文件里写出伪装目标与说明" "$(has "$CODE" 'echo "伪装目标: ${DEST}  (${dn})"')"
+yesno "info 文件里写出伪装目标与说明" "$(has "$CODE" 'echo "伪装目标: ${DEST}${dn:+  (${dn})}"')"
+# 用户自定义 REALITY_DEST 时 dest_note 取不到说明 —— 括号里不写, 但"必须一字不差"
+# 那两行必须照常输出。自定义域名更容易抄错, 更需要这句提醒, 不能因为查不到说明就
+# 把整段(含警告)一起跳过。
+yesno "自定义域名时警告不被跳过" "$(has "$CODE" 'dn=$(dest_note "$DEST" 2>/dev/null) || dn=""')"
 yesno "终端 SNI 下面补站点说明" "$(has "$CODE" 'print_dest_note')"
 # 每档取样数必须随档内数量浮动。写死 3 的话池子扩到多少都白扩。
 yesno "每档随机数随档内数量浮动" "$(has "$CODE" 'n_rand=$(( ${#grp[@]} / 3 ))')"
