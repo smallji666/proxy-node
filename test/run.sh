@@ -1090,6 +1090,17 @@ BODY
   run_harness "$H6" "$SD6"
 fi
 
+# 诊断报告是要外发的。CRED_KEYS 里每一个凭据都必须登记进脱敏清单, 漏一个就等于
+# 把整套连接凭据的一部分公开出去。按数据源自动比对: 以后往 CRED_KEYS 加字段
+# 而忘了登记脱敏, 这里会当场报红。
+# 注意这条必须在 harness 的 heredoc 之外 —— 里面没有 $SRC, set -u 会直接退出。
+diag_miss=""
+for _dk in $(sed -n 's/^CRED_KEYS="\(.*\)"/\1/p' "$SRC") UUID PRIV PUB SID EGRESS_URL; do
+  grep -qF "diag_sec \"\${${_dk}:-}\"" "$SRC" || diag_miss="${diag_miss} ${_dk}"
+done
+yesno "诊断报告脱敏覆盖全部凭据${diag_miss:+ (漏:${diag_miss})}" \
+  "$([ -z "$diag_miss" ] && echo yes || echo no)"
+
 # ---- verify_sha256: 安全关键闸门必须真的中止(以前只有字符串反断言) ----
 SD7="$TD/verify"; mkdir -p "$SD7"
 H7="$TD/verify-h.sh"

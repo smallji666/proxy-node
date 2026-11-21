@@ -6201,6 +6201,10 @@ cmd_diag(){
   diag_sec "${SID:-}";       diag_sec "${HY2_PASS:-}";    diag_sec "${OBFS_PASS:-}"
   diag_sec "${SS2022_PASS:-}"; diag_sec "${ANYTLS_PASS:-}"; diag_sec "${TUIC_PASS:-}"
   diag_sec "${TUIC_UUID:-}"; diag_sec "${SUB_TOKEN:-}";   diag_sec "${EGRESS_URL:-}"
+  # 证书指纹不是私钥, 但它们是"客户端拿来固定服务端身份"的值 —— 连同 UUID
+  # 一起外发, 等于把整套连接凭据补齐了。报告要外发, 一并隐去。
+  diag_sec "${CERT_HEX:-}"; diag_sec "${CERT_SPKI_B64:-}"
+  diag_sec "${SB_PIN:-}";   diag_sec "${HY2_PIN:-}"
   # 多设备凭据在 users.txt 里(每个设备一个 UUID), 只登记 state 里的主 UUID 不够,
   # 否则 [9]/[10] 段把内核日志原文贴出去时, 别的设备 UUID 会原样外泄。
   local du
