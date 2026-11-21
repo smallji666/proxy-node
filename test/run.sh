@@ -247,33 +247,31 @@ yesno "指纹进 STATE_KEYS" "$(has "$(cat "$SRC")" 'DEFAULT_NODE REALITY_FP CER
 yesno "指纹写进 VLESS 链接" "$(has "$CODE" 'sni=${DEST}&fp=${REALITY_FP:-chrome}')"
 yesno "指纹写进 sing-box 订阅" "$(has "$CODE" '"fingerprint": "${REALITY_FP:-chrome}"')"
 yesno "指纹非法回退 chrome" "$(has "$CODE" '不是 Xray 认识的指纹, 已回退 chrome')"
-yesno "伪装站池统一常量" "$(has "$CODE" 'REALITY_DESTS="www.amazon.com www.samsung.com')"
+yesno "伪装站池统一常量" "$(has "$CODE" 'REALITY_DESTS="www.samsung.com www.nvidia.com')"
 yesno "两处挑选共用池子" "$(has "$CODE" 'cands+=($REALITY_DESTS)')"
 yesno "池子含冷门技术站" "$(has "$CODE" 'www.python.org www.kernel.org')"
-# 主判据是流量排名, 不是"行业铺开"也不是"证书 SAN 小"。上一版反了: 为了行业多样
-# 和 SAN 小, 把 adobe(59) / oracle(217) / cisco(240) 换成了 micron(12595) /
-# bosch(10263) —— 流量掩护反而差了一个量级。这里断言池子里确实留着高排名站。
+# 这一版是**回退到最初那 20 个**(用户要求: 他认得这些站), 只剔了套 CF 的 suse。
+# 闸门守两件事: (1) 最初那批站别又被"优化"掉; (2) suse 别被加回来。
 yesno "池子含顶级流量站(adobe 59)" "$(has "$CODE" 'www.adobe.com')"
-# amazon(28) 一度被排除, 理由写的是"国内不可达"。实测是错的: 直连 503(应用层),
-# TCP 与 TLS 都正常, TLS1.3 + h2 + 自家 CA + 不套 CF, 四条硬判据全过。
-yesno "池子含 amazon(28, 排名最高的可用站)" "$(has "$CODE" 'www.amazon.com www.samsung.com')"
-yesno "池子含 cisco(240) 与 dell(361)" \
-  "$(has "$CODE" 'www.cisco.com www.autodesk.com www.siemens.com')"
-yesno "池子含汽车与学术类(行业不至于单一)" \
-  "$(has "$CODE" 'www.tesla.com www.cam.ac.uk')"
-yesno "池子有非 .com 域名" "$(has "$CODE" 'www.cam.ac.uk')"
+# nginx(104) / ibm(282) 曾被"行业重挑"和一次探测失败误伤, 排名比池子一半的站都高。
+yesno "池子含 nginx(104)" "$(has "$CODE" 'www.apache.org www.nginx.com www.postgresql.org')"
+yesno "池子含 ibm(282)" "$(has "$CODE" 'www.amd.com www.ibm.com www.tesla.com')"
+yesno "池子含 dell/hp/intel(硬件大厂)" \
+  "$(has "$CODE" 'www.oracle.com www.dell.com www.hp.com www.intel.com')"
+yesno "池子含 tesla" "$(has "$CODE" 'www.tesla.com www.adobe.com')"
+# bing 只到 TLS1.2, 会进档位 2; 用户要求保留, 那就保留 —— 但必须同时在 dest_note
+# 里标出这一点, 否则等于假装它和其他站一样。
+yesno "池子含 bing(用户要求, 标注为备选档)" "$(has "$CODE" 'www.mysql.com www.bing.com')"
+yesno "bing 的说明里写了 TLS1.2 备选档" "$(has "$CODE" '只到 TLS1.2, 排在备选档')"
+# suse 套 CF(实测 Server: cloudflare + CF-RAY), 用户自己定的规则是"千万不能套 CF"。
+yesno "套 CF 的 suse 没在池子里" "$(no "$CODE" 'www.debian.org www.suse.com')"
 yesno "池子与黑名单无 google" "$(no "$CODE" 'REALITY_DESTS="www.google.com')"
-# 池子规模下限。20 个的时候, 档位 1 只有十几个合格站, 而"每档取最快 3 个随机"
-# 让实际只有 3 种可能值 —— 全网几十万台机器集中在这 3 个域名上, 统计"哪些机房
-# IP 在跟这三个站握手"照样能整段捞出来。
-# 下限 30: 30 个 -> 档位 1 约 25 个 -> 取前 8 -> 8 种可能, 再往上加收益就很小了
-# (分散度由"每档取 N"决定, 不由池子大小决定), 反而让安装时多探一堆站。
-# 上限 40 是防止有人又往池子里堆流量掩护弱的站 —— 数量不是质量。
+# 池子规模: 回退到最初那批, 就是 19 个(20 减 suse)。上限 22 是防止有人又往里堆。
+# 下限 15: 再少的话档位 1 剩不下几个, 分散度(每档取前 N 随机)就没意义了。
 dest_n=$(bash -c 'eval "$(grep -m1 "^REALITY_DESTS=" setup.sh)"; set -- $REALITY_DESTS; echo $#' 2>/dev/null)
-yesno "伪装站池在 25~35 个之间(当前 ${dest_n})" \
-  "$([ -n "$dest_n" ] && [ "$dest_n" -ge 25 ] && [ "$dest_n" -le 35 ] && echo yes || echo no)"
-# 池子里每个域名都必须有 dest_note 说明。池子一半是 cam.ac.uk / elastic.co /
-# fedora 这种普通用户不认识的域名, 而 SNI 是必须一字不差抄进客户端的一行 ——
+yesno "伪装站池在 15~22 个之间(当前 ${dest_n})" \
+  "$([ -n "$dest_n" ] && [ "$dest_n" -ge 15 ] && [ "$dest_n" -le 22 ] && echo yes || echo no)"
+# 池子里每个域名都必须有 dest_note 说明。SNI 是必须一字不差抄进客户端的一行 ——
 # 看到陌生域名又没有任何线索, 抄错了也只会得到"连接超时"。这条闸门保证以后
 # 往池子里加站的人顺手补上说明, 而不是靠记得。
 note_fn=$(awk '/^dest_note\(\)\{/,/^\}/' "$SRC")
@@ -291,6 +289,15 @@ yesno "info 文件里写出伪装目标与说明" "$(has "$CODE" 'echo "伪装�
 # 把整段(含警告)一起跳过。
 yesno "自定义域名时警告不被跳过" "$(has "$CODE" 'dn=$(dest_note "$DEST" 2>/dev/null) || dn=""')"
 yesno "终端 SNI 下面补站点说明" "$(has "$CODE" 'print_dest_note')"
+# 用户看到不认识的域名, 除了"这是什么站"还想知道"还有哪些可选、能不能换"。
+# proxy dest 只读, 不偷偷改配置(换站要重签证书 + 重写订阅, 那是 install 的活)。
+yesno "dest 子命令已注册" "$(has "$CODE" 'dest)           cmd_dest')"
+yesno "proxy dest 会列出整个池子" "$(has "$CODE" '伪装目标候选池')"
+yesno "proxy dest 给了换站命令" "$(has "$CODE" 'REALITY_DEST=www.oracle.com bash /root/setup-proxy.sh install')"
+# 池子里有 bing(只到 TLS1.2)这种例外, 所以列表末尾不能说"全部 TLS1.3 + h2" ——
+# 一句不准确的总结比没有总结更糟: 用户会以为 bing 和别的站一样强。
+yesno "proxy dest 的总结没有夸大(区分备选档)" "$(has "$CODE" '除标注了备选档的, 均为 TLS 1.3')"
+yesno "proxy dest 在帮助里" "$(has "$CODE" 'dest [list]      查看当前伪装目标站')"
 # 每档取样数必须随档内数量浮动。写死 3 的话池子扩到多少都白扩。
 yesno "每档随机数随档内数量浮动" "$(has "$CODE" 'n_rand=$(( ${#grp[@]} / 3 ))')"
 yesno "每档随机数上限 8" "$(has "$CODE" '[ "$n_rand" -gt 8 ] && n_rand=8')"

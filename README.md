@@ -100,7 +100,14 @@ REALITY_DEST=www.samsung.com bash /root/setup-proxy.sh install
 
 换伪装站时自签证书会重签（CN 与新站一致）。节点备注名默认按出口 IP 反查厂商（`DigitalOcean-VLESS` 等），改：`proxy name RackNerd`。
 
-伪装站是脚本从一份内置池子里随机挑的，池子里一半是 `www.cam.ac.uk`、`www.elastic.co` 这种平时不会访问的域名。`proxy info` 会在 SNI 旁边标出它是哪个网站——**这一行必须与客户端一字不差**，抄错不会提示 SNI 错误，只会表现为连接超时或握手失败。池子里的站都实测过 TLS 1.3 + h2、不套 Cloudflare、全球流量排名 2100 名以内。
+伪装站是脚本从一份内置池子里随机挑的，池子里都是些眼熟的大站（samsung / nvidia / ibm / oracle / dell / hp / intel / adobe / mozilla / nginx / mysql / python…），全部实测过不套 Cloudflare、国内可直连、全球流量排名 2100 名以内。想看清当前用的是哪个、还有哪些可选：
+
+```bash
+proxy dest          # 当前伪装目标是什么网站
+proxy dest list     # 池子里全部候选（带说明）
+```
+
+**SNI 这一行必须与客户端一字不差**，抄错不会提示 SNI 错误，只会表现为连接超时或握手失败。`proxy info` 也会在 SNI 旁边标出它是哪个网站。
 
 ---
 

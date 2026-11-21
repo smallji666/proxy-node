@@ -1667,83 +1667,68 @@ verify_reality(){
 # 为什么不用排行榜动态拉: 安装时必须能离线工作。拉列表这一步一旦要联网, 被墙时
 # 就装不下去了 —— 而"被墙"正是用户来装这个的原因。
 #
-# 规模: 28 个, 主判据是**全球流量排名**(Tranco), 全部在 2100 名以内。
+# 规模: 19 个 = 最初那 20 个里除 suse 之外的全部。
 #
-# 上一版这里犯过一个错: 为了"行业多样"和"证书 SAN 小", 把流量大的站换成了
-# 流量小的站 —— micron(12595) / bosch(10263) / abb(4009) 都进了池子, 而
-# adobe(59) / oracle(217) / cisco(240) 被剔掉。方向是反的: 流量规模决定"你的
-# 握手能不能淹没在噪音里", 这一条比行业多样和 SAN 大小都重要。SAN 大根本不是
-# 安全风险 —— REALITY 是实时转发握手, 证书特征不影响探测结果。
+# 这一版是**回退**, 理由写在这里, 免得以后有人又"优化"回去:
+#   用户明确要求先用最初那 20 个 —— 这些站他认得, 装完看到 www.oracle.com 而不是
+#   www.cam.ac.uk, 心里有底。这个诉求是合理的: SNI 是要一字不差抄进客户端的东西,
+#   认不出来的域名会让人怀疑自己是不是被坑了。安全性本身不取决于用户是否听过,
+#   但"能核对"这件事有独立价值 —— 见下面 dest_note。
 #
-# 为什么没有 bing / apple / microsoft —— 这三个是所有人第一个想到的站, 逐条实测过,
-# 结论各不相同, 所以理由必须分开写清楚:
-#   bing.com      只协商到 TLS 1.2(实测三次都是 TLSv1.2)。REALITY 要 TLS 1.3, 它进
-#                 档位 2, 抗主动探测弱一档。这是硬性不合格, 没有讨论空间。
-#   apple.com     实测 TLS1.3 + h2 + 自家 CA(Apple Public EV Server RSA CA 4 - G1)
-#                 + SAN 只有 2 个域名 + **不套 CF**(响应头里没有 server/cf-ray)。
-#                 技术上完全合格, 剔掉它的理由不是技术: 几乎所有 REALITY 教程都写它,
-#                 全网几十万节点压在同一个 SNI 上, 它本身就成了指纹。
-#   microsoft.com 同上(自家 CA、SAN 7 个、不套 CF), 理由同上。
-# 之前这里写过"microsoft / apple 套 CF" —— 那是错的, 实测 cf-ray 为 0, 已改正。
+# 20 个里只剔了 suse, 两个理由都是实测的:
+#   1) 套 CF: 响应头 Server: cloudflare + CF-RAY(实测三次)。CF 的 IP 段被大量代理
+#      和 VPN 占用, 是最容易被整体标记的一类 —— 用户自己也定了"千万不能套 CF"。
+#   2) 握手不稳: 有一轮三次探测全失败(后来复测 3/3 又正常)。这种时通时不通的站
+#      不该进池子 —— 节点装完能不能用, 不该赌目标站当时的状态。
 #
-# amazon.com 之前被这里写成"国内不可达" —— 那也是错的, 同一个错:
-#   实测直连返回 503(应用层错误, TCP 与 TLS 都正常建立)、TLS1.3 + h2、
-#   自家 CA(Amazon RSA 2048 M04)、不套 CF —— 四条硬判据全过。
-#   503 只是裸 GET / 被亚马逊拒了, 而 REALITY 只用它的握手, 根本不发 HTTP 请求。
-#   排名 28, 是池子里流量最大的站, 已加入。
-# 真正被墙的是 google / youtube / dropbox 这一类(直连 TCP 就通不了), 那几个绝对不能
-# 当 SNI: 发出去的 ClientHello 会先被拦掉, 握手根本到不了 VPS。
+# bing 按用户要求放回去了, 但要知道它站在什么位置: 只协商到 TLS 1.2(实测三次都是
+# TLSv1.2), dest_rank 会把它判进档位 2。档位 1 有 18 个候选, 所以实际上永远轮不到
+# 它 —— 留着不影响安全, 只是让"池子里有 bing"这件事成立, 不再需要为此争论。
 #
-# 排序按行业分组只是为了好读, 每组内部按排名从高到低:
-#   电商(1):          amazon 28
-#   消费电子/硬件(9): samsung 122 / hp 285 / nvidia 352 / dell 361 / intel 453 /
-#                     asus 715 / lenovo 794 / amd 1114 / sony 2045
-#   企业软件/工业(4): oracle 217 / cisco 240 / autodesk 339 / siemens 1166
-#   软件/开发(9):     adobe 59 / mozilla 92 / apache 140 / ubuntu 158 / debian 325 /
-#                     python 742 / kernel 1272 / jetbrains 933 / fedora 1399
-#   数据库(3):        mysql 539 / postgresql 1161 / elastic 1984
-#   汽车(1):          tesla 1105
-#   学术(1):          cam.ac.uk 1526
-# 剔掉的: ibm 与 docker(实测不稳定: 同一台机器上时通时不通)、micron / bosch / abb /
-# eclipse / ethz / ti / toyota(排名 2500~12600, 流量掩护太弱), 以及套 CF / TLS1.2 的
-# 那些。另外两个可惜的: zoom.us 排名 58 但套了 CF; dropbox 排名 130 但国内连不上。
-REALITY_DESTS="www.amazon.com www.samsung.com www.hp.com www.nvidia.com www.dell.com www.intel.com www.asus.com www.lenovo.com www.amd.com www.sony.com www.oracle.com www.cisco.com www.autodesk.com www.siemens.com www.adobe.com www.mozilla.org www.apache.org www.ubuntu.com www.debian.org www.python.org www.kernel.org www.jetbrains.com www.fedoraproject.org www.mysql.com www.postgresql.org www.elastic.co www.tesla.com www.cam.ac.uk"
+# 为什么没有 apple / microsoft(用户反复问过, 一并记在这里):
+#   两家实测都是 TLS1.3 + h2 + 自家 CA + 不套 CF(cf-ray 为 0), 技术上完全合格。
+#   剔掉的理由不是技术, 是"被教程用烂了": 几乎所有 REALITY 教程都写这两个, 全网
+#   几十万节点压在同一个 SNI 上, 它本身就成了指纹。
+#   (更早这里写过"microsoft / apple 套 CF", 那是错的, 已改正。)
+#
+# 加站前对照这五条: TLS 1.3 + ALPN h2 / 不套 CF / 国内可直连 / 全球流量排名够大 /
+# 不敏感不短命。dest_rank 会在安装时自动复核: 探不到 TLS1.3 的降档, 真实握手失败的
+# 跳过 —— 所以某个站临时挂了也不会让安装失败, 只是多花几秒探测。
+# 剔站之前至少串行复测 3 次: 国内网络跑并发探测会大量超时, 单次失败不足以判定一个
+# 站不合格(nginx 和 ibm 就是被这样误伤过一次, 后来各测 5 次都是 5/5)。
+#
+# 排名(Tranco, 2026-11 实测): bing 45 / adobe 59 / mozilla 92 / nginx 104 /
+#   samsung 122 / apache 140 / oracle 217 / ibm 282 / hp 285 / debian 325 / nvidia 352 /
+#   dell 361 / intel 453 / mysql 539 / python 742 / tesla 1105 / amd 1114 /
+#   postgresql 1161 / kernel 1272
+REALITY_DESTS="www.samsung.com www.nvidia.com www.amd.com www.ibm.com www.tesla.com www.adobe.com www.oracle.com www.dell.com www.hp.com www.intel.com www.mozilla.org www.python.org www.kernel.org www.debian.org www.apache.org www.nginx.com www.postgresql.org www.mysql.com www.bing.com"
 
 # 每个伪装目标站"是什么"。为什么要这东西: SNI 是必须一字不差抄进客户端的一行,
-# 而池子里有一半是 www.cam.ac.uk / www.elastic.co / www.fedoraproject.org 这种
-# 普通用户平时不会访问的域名 —— 看到一个陌生域名又没有任何线索, 只能靠猜, 猜错了
-# 也只会得到"连接超时", 不会有人告诉他抄错了。
+# 而池子里有一半是 www.kernel.org / www.debian.org / www.nginx.com 这种普通用户
+# 平时不会主动访问的域名 —— 看到一个陌生域名又没有任何线索, 只能靠猜, 猜错了也
+# 只会得到"连接超时", 不会有人告诉他抄错了。
 # 加池子成员必须在这里补一行: test/run.sh 会逐个检查, 漏了直接判红。
 dest_note(){
   case "$1" in
-    www.amazon.com)        echo "亚马逊官网" ;;
     www.samsung.com)       echo "三星电子官网" ;;
-    www.hp.com)            echo "惠普官网" ;;
     www.nvidia.com)        echo "英伟达官网" ;;
-    www.dell.com)          echo "戴尔官网" ;;
-    www.intel.com)         echo "英特尔官网" ;;
-    www.asus.com)          echo "华硕官网" ;;
-    www.lenovo.com)        echo "联想官网" ;;
     www.amd.com)           echo "AMD 官网" ;;
-    www.sony.com)          echo "索尼官网" ;;
-    www.oracle.com)        echo "Oracle 数据库厂商官网" ;;
-    www.cisco.com)         echo "思科官网" ;;
-    www.autodesk.com)      echo "Autodesk(AutoCAD 厂商)官网" ;;
-    www.siemens.com)       echo "西门子官网" ;;
+    www.ibm.com)           echo "IBM 官网" ;;
+    www.tesla.com)         echo "特斯拉官网" ;;
     www.adobe.com)         echo "Adobe(Photoshop 厂商)官网" ;;
+    www.oracle.com)        echo "Oracle 数据库厂商官网" ;;
+    www.dell.com)          echo "戴尔官网" ;;
+    www.hp.com)            echo "惠普官网" ;;
+    www.intel.com)         echo "英特尔官网" ;;
     www.mozilla.org)       echo "Mozilla(Firefox 厂商)官网" ;;
-    www.apache.org)        echo "Apache 软件基金会官网" ;;
-    www.ubuntu.com)        echo "Ubuntu 发行版官网" ;;
-    www.debian.org)        echo "Debian 发行版官网" ;;
     www.python.org)        echo "Python 官网" ;;
     www.kernel.org)        echo "Linux 内核官网" ;;
-    www.jetbrains.com)     echo "JetBrains(IDEA 厂商)官网" ;;
-    www.fedoraproject.org) echo "Fedora 发行版官网" ;;
-    www.mysql.com)         echo "MySQL 官网" ;;
+    www.debian.org)        echo "Debian 发行版官网" ;;
+    www.apache.org)        echo "Apache 软件基金会官网" ;;
+    www.nginx.com)         echo "Nginx 官网" ;;
     www.postgresql.org)    echo "PostgreSQL 官网" ;;
-    www.elastic.co)        echo "Elastic(Elasticsearch 厂商)官网" ;;
-    www.tesla.com)         echo "特斯拉官网" ;;
-    www.cam.ac.uk)         echo "剑桥大学官网" ;;
+    www.mysql.com)         echo "MySQL 官网" ;;
+    www.bing.com)          echo "微软 Bing 搜索引擎(只到 TLS1.2, 排在备选档)" ;;
     *) return 1 ;;
   esac
 }
@@ -5209,7 +5194,7 @@ write_info_file(){
       echo
     fi
     echo "[管理]"
-    echo "proxy info | name | sub | status | verify | restart | logs | audit"
+    echo "proxy info | dest | name | sub | status | verify | restart | logs | audit"
     echo "proxy user | reset | backup | upgrade | optimize | timezone | wizard | clean"
     echo "订阅目录: ${SUB_TOKEN_DIR:-${SUB_DIR}}"
   } 2>/dev/null > /root/proxy-info.txt || {
@@ -5917,6 +5902,58 @@ cmd_info(){
   print_links
   print_qr
   print_sub_info
+}
+
+# 看/换伪装目标站。
+#   proxy dest        当前用的是哪个站、它是什么网站
+#   proxy dest list   池子里全部候选(带说明), 用来挑一个自己认得的
+# 只读, 不偷偷改配置: 换站要重签证书、重写全部链接和订阅、重启内核, 那是 install
+# 的活。这里只负责让人看清"我这个 SNI 到底是什么站、还有哪些可选"。
+cmd_dest(){
+  need_root
+  load_state || die "尚未安装, 先执行: bash setup-proxy.sh install"
+  local dn d n
+  case "${1:-}" in
+    ""|current)
+      dn=$(dest_note "${DEST:-}" 2>/dev/null) || dn=""
+      echo
+      echo -e "${M}当前伪装目标${N}"
+      hr
+      echo "域名   : ${DEST}"
+      [ -n "$dn" ] && echo "是什么 : ${dn}"
+      echo -e "${D}所有协议共用这一个 SNI。客户端里必须一字不差 —— 抄错不会报 SNI"
+      echo -e "错误, 只会表现为连接超时或握手失败。${N}"
+      echo
+      echo -e "${D}看池子里还有哪些站可选: proxy dest list${N}"
+      echo
+      ;;
+    list|all)
+      n=0
+      echo
+      echo -e "${M}伪装目标候选池${N}"
+      hr
+      # 池子是空格分隔的字符串, 这里就是要按空格拆开 —— 不加引号是故意的。
+      # shellcheck disable=SC2086
+      for d in $REALITY_DESTS; do
+        n=$((n + 1))
+        if dn=$(dest_note "$d" 2>/dev/null); then
+          printf '  %2d. %-24s %s\n' "$n" "$d" "$dn"
+        else
+          printf '  %2d. %-24s\n' "$n" "$d"
+        fi
+      done
+      hr
+      echo -e "${D}共 ${n} 个, 全部实测: 不套 Cloudflare / 国内可直连 / 全球流量排名"
+      echo -e "2100 名以内; 除标注了备选档的, 均为 TLS 1.3 + ALPN h2。"
+      echo -e "安装时随机挑一个, 也可以自己指定(换站会重签证书并重写订阅):${N}"
+      echo "  REALITY_DEST=www.oracle.com bash /root/setup-proxy.sh install"
+      echo
+      ;;
+    *)
+      die "用法: proxy dest [list]
+换站: REALITY_DEST=<上面列表里的域名> bash /root/setup-proxy.sh install"
+      ;;
+  esac
 }
 
 # 改节点备注名。只改客户端显示, 不碰服务端配置, 所以不用重装也不用重启内核
@@ -9040,6 +9077,7 @@ Proxy Node Installer v${SCRIPT_VERSION} (${BUILD_DATE})
   optimize [项]    一键优化 VPS: all(默认) / bbr / swap / time / log
   timezone [时区]  设置时区: 无参数=菜单, auto=按出口IP自动, 或直接给 Asia/Tokyo
   info             查看节点信息、链接、二维码
+  dest [list]      查看当前伪装目标站是什么网站; list 列出池子里全部候选
   sub              重新生成订阅文件
   name [名字]      改节点备注名(只影响客户端显示, 不改服务端配置)
   status           服务状态与监听端口
@@ -9138,6 +9176,7 @@ main(){
       ;;
     fresh)          CLEAN=1; cmd_install ;;
     info)           cmd_info ;;
+    dest)           cmd_dest "${2:-}" ;;
     name|rename)    cmd_name "${2:-}" ;;
     sub)            cmd_sub ;;
     status)         cmd_status ;;
