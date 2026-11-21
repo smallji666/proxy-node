@@ -524,6 +524,30 @@ done
 yesno "凭据键都有真实赋值来源${cred_noassign:+ (缺:${cred_noassign})}" \
   "$([ -z "$cred_noassign" ] && echo yes || echo no)"
 
+# ---- 死代码: 定义了却没有任何调用点的函数 ----
+# 精简是硬要求, 而"重构后忘了删旧函数"是最容易积累的一类。这里数引用次数:
+# 注释行不算; 定义行本身也会匹配到自己的名字, 所以要扣掉一次 —— 不扣的话
+# 每个函数都至少"有 1 次引用", 这条断言永远为真。
+deadfns=$(awk '
+  /^[A-Za-z_][A-Za-z_0-9]*\(\)\{/ { name=$0; sub(/\(\).*/,"",name); def[name]=NR; order[++n]=name }
+  { body[NR]=$0 }
+  END {
+    for (i=1;i<=n;i++) {
+      name=order[i]; cnt=0
+      for (j=1;j<=NR;j++) {
+        line=body[j]
+        if (line ~ /^[[:space:]]*#/) continue
+        if (line !~ ("(^|[^A-Za-z_0-9-])" name "([^A-Za-z_0-9]|$)")) continue
+        cnt++
+      }
+      if (cnt > 0 && def[name]) cnt--
+      if (cnt <= 0) printf "%s ", name
+    }
+  }
+' "$SRC")
+yesno "没有从未被调用的死函数${deadfns:+ (残留:${deadfns})}" \
+  "$([ -z "$deadfns" ] && echo yes || echo no)"
+
 # ---- 全项目加固回归: D-F 内核兼容 / 自检 / 失败聚合 / 链接 ----
 yesno "sing-box 真实探测 AF_INET6" "$(has "$CODE" 'socket.AF_INET6')"
 yesno "sing-box 启动失败回退 v4" "$(has "$CODE" 'SB_FORCE_V4=1')"

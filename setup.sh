@@ -343,11 +343,6 @@ canon_protocols(){
   printf '%s' "$out"
 }
 
-# version_ge A B  ->  A >= B (按版本号而非字符串比较)
-version_ge(){
-  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V 2>/dev/null | head -1)" = "$2" ]
-}
-
 # 从终端读一行。
 # 关键: read -p 的提示符走 stderr, 一旦调用方 2>/dev/null 就会把提示吞掉,
 # 用户只看到光标不动 -> 误判为"卡死"。所以提示符必须自己写到 /dev/tty。
@@ -6111,8 +6106,6 @@ diag_redact(){
     printf '%s\n' "$line"
   done
 }
-
-strip_ansi(){ sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g'; }
 
 # 三个内核的 version 输出格式各不相同, 统一抠出版本号:
 #   xray      -> "Xray 26.3.27 (Xray, Penetrates Everything.)"
