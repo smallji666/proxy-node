@@ -1350,6 +1350,15 @@ ensure_users_file(){
     chmod 600 "$USERS_FILE"
     warn "主 UUID 已变化, 已同步 users.txt 首行; 其余设备凭据保留"
   fi
+  # 末行可能没有换行(手改过, 或从备份包恢复来的)。读取侧(build_clients_json /
+  # sb_users_json)都用 `|| [ -n "$u" ]` 兜住了这种状态, 但写入侧没有:
+  # `proxy user add` 直接 printf >> 会粘在最后一行后面, 两台设备的凭据合成一行 ——
+  # 老设备失效, 新设备在 user list 里显示成一段乱码, 而两边都不报错。
+  # 这里补一个换行, 让写侧也安全。`tail -c 1` 取出的是最后一个字节, 命令替换会
+  # 吃掉末尾换行, 所以"非空"恰好等价于"文件不以换行结尾"。
+  if [ -s "$USERS_FILE" ] && [ -n "$(tail -c 1 "$USERS_FILE" 2>/dev/null)" ]; then
+    printf '\n' >> "$USERS_FILE"
+  fi
 }
 
 build_clients_json(){
@@ -8837,6 +8846,9 @@ Proxy Node Installer v${SCRIPT_VERSION} (${BUILD_DATE})
   NODE_NAME=xxx                  节点备注名
   SUB_HTTP=1                     起订阅 HTTP 服务
   SUB_BIND=0.0.0.0               订阅服务监听地址(默认 127.0.0.1)
+  EGRESS_URL=socks5://u:p@h:1080 上游出口代理(住宅 IP), 安装时一并生效
+                                  等同装完再执行 proxy egress; 需要 reality 或
+                                  sing-box 承载, 纯 hy2 组合不支持(会明确告知)
   XRAY_VERSION=26.3.27            固定 Xray 版本(留空=追官方最新版, 用官方 .dgst 校验)
   HY2_VERSION=2.13.0             固定 hysteria 版本(留空=追官方最新 2.x, 用官方 hashes.txt 校验)
   ALLOW_UNVERIFIED_BIN=1         跳过二进制完整性校验(不推荐, 仅自定义版本时用)

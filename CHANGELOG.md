@@ -108,4 +108,56 @@
 #   这正是最常见的"我明明配了还是泄露"的原因。
 #   分发处同时修掉一个静默失效: 原来 `dnstest|dns) cmd_dnstest ;;` 不传参, 加了
 #   --client 也会被吞掉 —— 用户敲了跟没敲一样, 还不报错。
+# 修订 20: 全项目逐行审查(安全 + 正确性) —— 最严重的一处让默认组合根本装不完。
+#   (1) CERT_HEX 全脚本从未赋值。compute_cert_pins 只算了 SPKI 一项, 却把
+#   CERT_HEX 写进成功条件 —— 于是该函数恒返回失败, ensure_hy2 每次都 die 在
+#   "证书指纹计算失败", 默认组合 reality,hy2 走不到最后。这是随 v1.0 重写误删的:
+#   旧注释写"DER 那份从来没被读过……去掉"时, 把赋值和读取一起删了, 但
+#   HY2_PIN="${CERT_HEX:-}" 仍在读。两个指纹算法不同不能混用: 整证书 DER 的
+#   SHA-256(hex)给 hysteria2 的 pinSHA256 / mihomo 的 fingerprint; 公钥 SPKI 的
+#   SHA-256(base64)给 sing-box 的 certificate_public_key_sha256。
+#   (2) 订阅服务的 token 比较对非 ASCII 的 str 抛 TypeError: hmac.compare_digest
+#   只吃 bytes。请求路径里塞一个 %C3%A9 就能把一次 404 变成未捕获异常。
+#   (3) write_singbox_config 缺 ensure_users_file: 少了它 sb_users_json 退回
+#   TUIC_UUID/ANYTLS_PASS 那套老字段, 而 gen_links 用 users.txt 首行 —— 两边算出
+#   的凭据不同, 客户端必然连不上, 报错还指向"密码错误"这种误导方向。
+#   (4) effective_default_node 没启用 REALITY 时照报 reality, 但那个出站根本不在
+#   订阅里; 三份 writer 各自兜底换了协议, 只有 `proxy sub` 的输出还印 reality。
+#   (5) STUN_SB_PORTS 是手写常量, 等于把 STUN_WEBRTC_PORTS 抄了第二遍 —— 上面加
+#   端口、这里忘了改, sing-box 就少拦一个, WebRTC 照样漏真实 IP。改成现算, 且
+#   产物与改造前逐字节一致(分隔符必须 ", " 而不是 ",")。
+#   (6) parse_egress 返回 '|' 分隔的五段记录, 用户名/密码带竖线会把字段拆错位;
+#   valid_ipv4 / valid_bind 放行前导零(010 有的实现按八进制=8, 有的拒收)。
+#   (7) 补齐 5 处漏声明的 local(全局污染)、save_state 把 INSTALLED_AT 落到变量、
+#   4 处 die 前清理临时目录、删掉两个从未被调用的死函数。
+#   新增两条系统性闸门, 都用旧版本验证过确实能抓到对应缺陷:
+#   "凭据键都有真实赋值来源"(KEY="" 清空不算赋值) 与 "没有从未被调用的死函数"
+#   (定义行自身会匹配到自己的名字, 计数要扣掉一次, 否则断言永远为真)。
+# 修订 21: 全项目逐行审查(健壮性) —— 固定等待是一类系统性缺陷, 不是个别笔误。
+#   `sleep 2` 之后立刻 systemctl is-active, 在慢机器上服务还没绑定端口就被判
+#   "启动失败"。15 处的代价各不相同, 每一处都不是"多等两秒"这么简单:
+#   安装主路径整台机器装到一半 die(配置完全正常); 升级路径把能用的新版本判成
+#   失败并回滚一次本来成功的升级; hy2 的三级降级链每误判一级就真降一级配置,
+#   白丢 IPv4-only 出站与 sniff 两层防护 —— 一次计时竞态换一次安全降级;
+#   sing-box 白白把 "::" 换成 0.0.0.0, 双栈机器丢掉 IPv6。
+#   全部换成已有的 wait_active(轮询最多 6 秒, 成功即返回): 正常情况 0.3 秒就
+#   返回, 比原来的 2 秒更快; 慢机器则一直等到真的起来。剩下三处不是 systemd
+#   服务的(selftest 里临时起的 sing-box 客户端)改成等 SOCKS 端口可连接 ——
+#   端口没起来时 curl 立刻拿到 000, 结论却印成"不通", 把"还没起来"误报成
+#   "协议坏了", 方向完全相反。
+#   新增闸门: 扫全文, 任何 `sleep N` 之后两行内出现 is-active 即判回归。用改造
+#   前的版本验证过, 准确命中 15 处。
+#   订阅服务加 timeout = 30: BaseHTTPRequestHandler 的 timeout 默认是 None, 而
+#   服务用的是 ThreadingHTTPServer(一个连接一个线程)。只连不发字节的客户端会
+#   让线程永远挂在 readline 上, 几百个就能吃光这个公网进程的内存。行为测试用
+#   1 秒子类实测半开连接真的在 1.0s 内被关闭 —— 只断言"属性被设了"证明不了
+#   标准库会照它关连接。
+#   删掉 SB_HEX: 算了、写进 state.env、列进 CRED_KEYS, 全脚本却没有任何一处读。
+#   sing-box 的 TLS 出站只有 certificate_public_key_sha256 一个固定字段, 吃的是
+#   SPKI base64(SB_PIN)。新增闸门: STATE_KEYS / save_state 写入 / 实际读取三方
+#   闭合, 用旧版本验证过能准确报出 SB_HEX。
+#   一键安装命令三处(脚本 ONELINER / README / docs)补 --connect-timeout 10
+#   --max-time 120: 这是用户在新机器上敲的第一条命令, 目标被阻断时无超时的 curl
+#   会长时间停在"连接中"不给任何输出, 用户只看到光标闪烁。三处一起守, 防止下次
+#   只改一处。
 ```

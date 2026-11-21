@@ -1380,6 +1380,38 @@ else
   fail "build_clients_json harness 生成失败"
 fi
 
+# 读取侧兜住了"末行无换行", 写入侧以前没有: `user add` 直接 printf >> 会粘在
+# 最后一行后面, 两台设备的凭据合成一行 —— 老设备失效, 新设备显示成乱码,
+# 两边都不报错。这里真跑 ensure_users_file, 验证它会把缺的换行补上。
+H2U="$TD/users-h.sh"
+if mk_harness "$H2U" ensure_users_file; then
+cat >> "$H2U" <<'BODY'
+USERS_FILE="$STATE_DIR/users.txt"
+UUID="main-uuid"
+CREDS_UUID_CHANGED=0
+printf 'aaa|phone|2026-01-01\nbbb|laptop|2026-01-02' > "$USERS_FILE"
+ensure_users_file
+# 必须在追加之前查: 追加语句自己带 \n, 追加之后再查永远为真, 断言就没有意义了。
+# `tail -c 1` 输出为空 == 最后一个字节是换行(命令替换会吃掉末尾换行)。
+t "末行无换行: ensure_users_file 补齐了换行" \
+  "$([ -z "$(tail -c 1 "$USERS_FILE")" ] && echo yes || echo no)" yes
+# 补完换行之后, 模拟 user add 的追加
+printf '%s|%s|%s\n' "ccc" "tablet" "2026-01-03" >> "$USERS_FILE"
+t "末行无换行: 追加后行数为 3(没和末行合并)" "$(wc -l < "$USERS_FILE" | tr -d ' ')" 3
+t "末行无换行: 原末行设备名仍完整" \
+  "$(sed -n '2p' "$USERS_FILE" | awk -F'|' '{print $2}')" laptop
+t "末行无换行: 新设备独占一行" \
+  "$(sed -n '3p' "$USERS_FILE" | awk -F'|' '{print $2}')" tablet
+# 已经以换行结尾的文件不该被再加一个空行
+printf 'aaa|phone|2026-01-01\n' > "$USERS_FILE"
+ensure_users_file
+t "已有换行: 不会多加空行" "$(wc -l < "$USERS_FILE" | tr -d ' ')" 1
+BODY
+  run_harness "$H2U" "$TD"
+else
+  fail "ensure_users_file harness 生成失败"
+fi
+
 # ---------------------------------------------------------------- 10. 行为验证脚本(mock, 不联网)
 # 每个脚本登记"至少应跑多少条断言"。阈值取实际条数附近: 以前统一写 5,
 # 而真实是 8~55 条, 脚本跑到一半就退也能混过闸门。改断言数时同步这里。
