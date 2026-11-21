@@ -112,8 +112,15 @@ jobs:
           docs_url=$(sed -n 's/.*var REPO = "\([^"]*\)".*/\1/p' docs/index.html)
           [ "$want" = "$docs_url" ] || {
             echo "一键命令 URL 不一致: setup.sh 推得 [$want], docs 写 [$docs_url]"; exit 1; }
-          grep -qF "curl -fsSL ${want}" README.md || {
-            echo "README 一键命令里的 URL 与 ${want} 不一致"; exit 1; }
+          # 一键命令里的 URL 必须和脚本推出来的一致。
+          # 不能用 `grep -qF "curl -fsSL ${want}"`: 一键命令可以带 curl 参数
+          # (--connect-timeout / --max-time), 那些参数就夹在 -fsSL 和 URL 中间,
+          # 死字符串一插参数就断 —— 曾经因为给三处补超时把这条闸门打红。
+          # 改成"同一行里既有 curl -fsSL 又有那个 URL", 既保留严格性又不锁参数顺序。
+          # 不用管道 + grep -q: 上游会吃 SIGPIPE, 在 -e -o pipefail 下假红。
+          if ! awk -v u="$want" 'index($0,u) && index($0,"curl -fsSL") {f=1} END{exit !f}' README.md; then
+            echo "README 一键命令里找不到 [curl -fsSL ... ${want}]"; exit 1
+          fi
           # ONELINER 的三道保险不能退化。源码里 \$ / \" 是转义后的字面量,
           # 一律用 grep -F 精确匹配, 别用 BRE(\( 会被当捕获组)。
           grep -qF 'ONELINER="PN_TMP=\$(mktemp /tmp/pn.XXXXXXXXXX)' setup.sh || { echo "一键命令没用 mktemp"; exit 1; }

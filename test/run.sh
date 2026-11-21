@@ -102,6 +102,13 @@ yesno "docs 一键命令用 mktemp" "$(has "$(cat docs/index.html)" 'mktemp /tmp
 yesno "脚本一键命令带超时" "$(has "$CODE" 'curl -fsSL --connect-timeout 10 --max-time 120')"
 yesno "README 一键命令带超时" "$(has "$(cat README.md)" 'curl -fsSL --connect-timeout 10 --max-time 120')"
 yesno "docs 一键命令带超时" "$(has "$(cat docs/index.html)" 'curl -fsSL --connect-timeout 10 --max-time 120')"
+# CI 里有一道"一键命令 URL 必须等于 REPO_URL 拼出来的那条"的闸门。以前它写的是
+# 死字符串 `curl -fsSL <url>`, 而超时参数正好夹在 -fsSL 和 URL 中间 —— 给三处补
+# 超时时把 CI 打红了, 本地却全绿。这里把 CI 的判定条件同步过来, 同一行里既有
+# curl -fsSL 又有那条 URL 才算过, 推到远端之前就能发现。
+onliner_url="https://raw.githubusercontent.com/$(sed -n 's/^REPO_URL="https:\/\/github.com\/\([^"]*\)".*/\1/p' "$SRC")/main/setup.sh"
+yesno "README 一键命令的 URL 与 REPO_URL 同源" \
+  "$(awk -v u="$onliner_url" 'index($0,u) && index($0,"curl -fsSL") {f=1} END{print (f?"yes":"no")}' README.md)"
 yesno "TUIC 不再被当 TCP+UDP 放行" "$(no "$CODE" '${TUIC_PORT}/tcp')"
 yesno "sysctl -p 返回码被接住" "$(has "$CODE" 'sysctl -p /etc/sysctl.d/99-proxy-optimize.conf 2>&1); sysrc=$?')"
 yesno "sysctl 逐项回读" "$(has "$CODE" 'sysctl -n "$k"')"
