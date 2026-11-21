@@ -302,4 +302,26 @@
 #   两个非 .com 域名(ethz.ch / cam.ac.uk)是故意的: 全是 .com 本身就是个特征。
 #   新增闸门 4 条: 池子覆盖汽车 / 工业 / 学术 / 有非 .com 域名。这四条守的不是
 #   "数量", 是"像不像同一个人会访问的"。
+# 修订 30: 上一版(修订 29)的判断反了 —— 主判据应该是流量排名, 不是行业多样。
+#   修订 29 为了"行业铺开"和"证书 SAN 小", 把流量大的站换成了流量小的:
+#     micron(12595) / bosch(10263) / abb(4009) 进了池子,
+#     adobe(59) / oracle(217) / cisco(240) / dell(361) 被剔掉。
+#   方向完全反了。流量规模决定"你的握手能不能淹没在噪音里", 这一条比行业多样和
+#   SAN 大小都重要; 而 SAN 大根本不是安全风险 —— REALITY 是实时转发握手, 证书
+#   特征不影响探测结果, "共享基础设施行为不可预测"只是间接推断, 不该当硬判据用。
+#   现在 27 个站全部在全球流量排名(Tranco)2100 名以内, 中位数约 400:
+#     adobe 59 / mozilla 92 / samsung 122 / apache 140 / ubuntu 158 / oracle 217 /
+#     cisco 240 / hp 285 / debian 325 / autodesk 339 / nvidia 352 / dell 361 /
+#     intel 453 / mysql 539 / asus 715 / python 742 / lenovo 794 / jetbrains 933 /
+#     tesla 1105 / amd 1114 / postgresql 1161 / siemens 1166 / kernel 1272 /
+#     fedora 1399 / cam.ac.uk 1526 / elastic 1984 / sony 2045
+#   顺带回答"为什么不直接用 bing / amazon 这种顶级大站":
+#     bing.com 只支持 TLS 1.2(实测), 进档位 2, 抗主动探测弱一档;
+#     amazon.com 在国内不可达, 发 SNI 的那一刻就被拦了, 握手到不了 VPS。
+#   排名 100 以内的站要么被墙(google / amazon / facebook / netflix / dropbox),
+#   要么套 CF(microsoft / apple / zoom), 要么只到 TLS 1.2(bing)。能用的最大站
+#   就是 adobe 这一档 —— 这是现实约束, 不是选站偷懒。
+#   又剔掉两个不稳定的: ibm(同一台机器两次实测一次通一次不通)、docker(先通后不通)。
+#   行业多样仍然保留, 但降为次要约束: 汽车(tesla) / 工业(siemens) / 学术(cam.ac.uk)
+#   各留一个, 且它们的排名都在 2100 以内, 不是拿流量换来的。
 ```

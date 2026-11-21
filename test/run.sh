@@ -249,13 +249,16 @@ yesno "指纹写进 sing-box 订阅" "$(has "$CODE" '"fingerprint": "${REALITY_F
 yesno "指纹非法回退 chrome" "$(has "$CODE" '不是 Xray 认识的指纹, 已回退 chrome')"
 yesno "伪装站池统一常量" "$(has "$CODE" 'REALITY_DESTS="www.samsung.com')"
 yesno "两处挑选共用池子" "$(has "$CODE" 'cands+=($REALITY_DESTS)')"
-yesno "池子含冷门技术站" "$(has "$CODE" 'www.python.org www.kernel.org www.apache.org')"
-# 行业铺开比"数量多"更重要: 池子全是科技公司的话, 这台机器长期只跟科技站握手,
-# 就是一个很干净的行业特征。这里断言池子里真的有非科技类的站。
-yesno "池子覆盖汽车行业" "$(has "$CODE" 'www.tesla.com www.toyota.com')"
-yesno "池子覆盖工业行业" "$(has "$CODE" 'www.bosch.com www.siemens.com www.abb.com')"
-yesno "池子覆盖学术机构" "$(has "$CODE" 'www.ethz.ch www.cam.ac.uk')"
-yesno "池子有非 .com 域名(行业/地域更散)" "$(has "$CODE" 'www.ethz.ch www.cam.ac.uk')"
+yesno "池子含冷门技术站" "$(has "$CODE" 'www.python.org www.kernel.org')"
+# 主判据是流量排名, 不是"行业铺开"也不是"证书 SAN 小"。上一版反了: 为了行业多样
+# 和 SAN 小, 把 adobe(59) / oracle(217) / cisco(240) 换成了 micron(12595) /
+# bosch(10263) —— 流量掩护反而差了一个量级。这里断言池子里确实留着高排名站。
+yesno "池子含顶级流量站(adobe 59)" "$(has "$CODE" 'www.adobe.com')"
+yesno "池子含 cisco(240) 与 dell(361)" \
+  "$(has "$CODE" 'www.cisco.com www.autodesk.com www.siemens.com')"
+yesno "池子含汽车与学术类(行业不至于单一)" \
+  "$(has "$CODE" 'www.tesla.com www.cam.ac.uk')"
+yesno "池子有非 .com 域名" "$(has "$CODE" 'www.cam.ac.uk')"
 yesno "池子与黑名单无 google" "$(no "$CODE" 'REALITY_DESTS="www.google.com')"
 # 池子规模下限。20 个的时候, 档位 1 只有十几个合格站, 而"每档取最快 3 个随机"
 # 让实际只有 3 种可能值 —— 全网几十万台机器集中在这 3 个域名上, 统计"哪些机房

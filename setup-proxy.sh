@@ -1667,22 +1667,34 @@ verify_reality(){
 # 为什么不用排行榜动态拉: 安装时必须能离线工作。拉列表这一步一旦要联网, 被墙时
 # 就装不下去了 —— 而"被墙"正是用户来装这个的原因。
 #
-# 规模: 28 个。下限由分散度倒推: pick_dest 每档取"档内数/3"个随机(上限 8),
-# 要凑满 8 种可能, 档位 1 就得有 24 个候选, 所以池子不能少于 26 左右。再往上加
-# 收益就很小了 —— 分散度由"每档取 N"决定, 不由池子大小决定。
+# 规模: 28 个, 主判据是**全球流量排名**(Tranco), 全部在 2100 名以内。
 #
-# 比数量更重要的是**行业铺开**, 这一点最容易被忽略: 池子里如果全是科技公司, 这台
-# 机器长期只跟科技站握手, 就是一个很干净的行业特征 —— 单一特征总比多样特征更容易
-# 被聚类。所以按 硬件(5) / 工业(3) / 汽车(2) / 软件(7) / 数据库(3) / 学术(2) /
-# 消费电子(2) / 发行版(4) 各占一块, 而不是把十个同类大厂堆进去。
+# 上一版这里犯过一个错: 为了"行业多样"和"证书 SAN 小", 把流量大的站换成了
+# 流量小的站 —— micron(12595) / bosch(10263) / abb(4009) 都进了池子, 而
+# adobe(59) / oracle(217) / cisco(240) 被剔掉。方向是反的: 流量规模决定"你的
+# 握手能不能淹没在噪音里", 这一条比行业多样和 SAN 大小都重要。SAN 大根本不是
+# 安全风险 —— REALITY 是实时转发握手, 证书特征不影响探测结果。
 #
-# 选站时实测过三样(TLS 版本 / ALPN / 响应头), 不合格的已经剔掉: 套 CF 的
-# (suse / redis / w3 / nodejs / gitlab / broadcom / ox.ac.uk / acm.org)、
-# TLS 只到 1.2 的(mit.edu / caterpillar)、探测不稳定的(mongodb / mariadb / honeywell)。
-# 证书 SAN 特别大的也剔掉了(oracle 83 / sony 79 / dell 26 / samsung 之外的多数),
-# 不是因为不安全, 而是"一张证书挂几十上百个域名"本身就说明它站在共享基础设施上,
-# 行为不如自有服务器可预测。
-REALITY_DESTS="www.samsung.com www.lenovo.com www.micron.com www.ti.com www.amd.com www.intel.com www.nvidia.com www.bosch.com www.siemens.com www.abb.com www.tesla.com www.toyota.com www.jetbrains.com www.eclipse.org www.docker.com www.mozilla.org www.python.org www.kernel.org www.apache.org www.postgresql.org www.mysql.com www.elastic.co www.ethz.ch www.cam.ac.uk www.nginx.com www.debian.org www.ubuntu.com www.fedoraproject.org"
+# 顺带回答一个常见疑问: 为什么不干脆用 bing / amazon 这种顶级大站?
+#   实测 bing.com 只支持 TLS 1.2(进档位 2, 抗主动探测弱一档);
+#   amazon.com 在国内本身不可达 —— 发 SNI 的那一刻就被拦了, 握手根本到不了 VPS。
+# 这就是现实: 排名 100 以内的站, 要么被墙(google / amazon / facebook / netflix),
+# 要么套 CF(microsoft / apple), 要么只到 TLS 1.2(bing)。能用的最大站就是 59 名的
+# adobe 这一档。
+#
+# 排序按行业分组只是为了好读, 每组内部按排名从高到低:
+#   消费电子/硬件(9): samsung 122 / hp 285 / nvidia 352 / dell 361 / intel 453 /
+#                     asus 715 / lenovo 794 / amd 1114 / sony 2045
+#   企业软件/工业(4): oracle 217 / cisco 240 / autodesk 339 / siemens 1166
+#   软件/开发(9):     adobe 59 / mozilla 92 / apache 140 / ubuntu 158 / debian 325 /
+#                     python 742 / kernel 1272 / jetbrains 933 / fedora 1399
+#   数据库(3):        mysql 539 / postgresql 1161 / elastic 1984
+#   汽车(1):          tesla 1105
+#   学术(1):          cam.ac.uk 1526
+# 剔掉的: ibm 与 docker(实测不稳定: 同一台机器上时通时不通)、micron / bosch / abb /
+# eclipse / ethz / ti / toyota(排名 2500~12600, 流量掩护太弱), 以及套 CF / TLS1.2 的
+# 那些。另外几个可惜的: zoom.us 排名 58 但套了 CF; dropbox 排名 130 但国内连不上。
+REALITY_DESTS="www.samsung.com www.hp.com www.nvidia.com www.dell.com www.intel.com www.asus.com www.lenovo.com www.amd.com www.sony.com www.oracle.com www.cisco.com www.autodesk.com www.siemens.com www.adobe.com www.mozilla.org www.apache.org www.ubuntu.com www.debian.org www.python.org www.kernel.org www.jetbrains.com www.fedoraproject.org www.mysql.com www.postgresql.org www.elastic.co www.tesla.com www.cam.ac.uk"
 # 黑名单: 实测不能用作 REALITY 伪装目标
 # Google 系不能当 dest: 这些域名在国内本身就是被墙的, 正常中国用户不会主动连,
 # GFW 看到 SNI=dl.google.com 反而更容易把连接挑出来。
