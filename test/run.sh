@@ -474,8 +474,16 @@ yesno "audit 不再把代理可达当出口可用" "$(has "$CODE" '上游代理�
 # 全部价值在"别骗人": 静态审计读真实产物、DoH 探测要求 Status:0 且有 Answer、
 # 隧道真起真收。这三条任何一条退化, 用户就会拿着一个假绿灯继续泄露。
 yesno "有 dnstest 子命令" "$(has "$CODE" 'cmd_dnstest(){')"
-yesno "dnstest 已注册分发" "$(has "$CODE" 'dnstest|dns)    cmd_dnstest')"
-yesno "dnstest 进用法表" "$(has "$CODE" 'dnstest          DNS 泄露自检')"
+# 分发必须把参数传进去: 少了 shift/\"$@\", `dnstest --client` 的 --client 会被吞掉,
+# 用户敲了跟没敲一样 —— 静默失效比报错更难发现。
+yesno "dnstest 分发传参" "$(has "$CODE" 'dnstest|dns)    shift || true; cmd_dnstest "$@"')"
+yesno "dnstest 进用法表" "$(has "$CODE" 'dnstest [--client]  DNS 泄露自检')"
+yesno "有客户端自检清单函数" "$(has "$CODE" 'print_client_checklist(){')"
+yesno "dnstest 支持 --client" "$(has "$CODE" '--client|-c) mode="client"')"
+# 这份清单会被复制到手机上读, 带上颜色变量或 printf %b 就会粘出一堆 [1;32m。
+yesno "清单不带颜色(便于粘到手机)" \
+  "$([ "$(awk '/^print_client_checklist\(\)\{/,/^}/' "$SRC" | grep -cE 'echo -e|%b|\$\{[GRNYMBCD]\}')" = 0 ] && echo yes || echo no)"
+yesno "清单订阅地址跟随监听地址" "$(has "$CODE" 'base="http://127.0.0.1:${SUB_PORT:-}/${SUB_TOKEN}"')"
 yesno "有三端订阅 DNS 审计函数" "$(has "$CODE" 'sub_dns_issues(){')"
 yesno "clash nameserver 逐条查(不只查存在)" "$(has "$CODE" '有 nameserver 条目没经代理')"
 yesno "DoH 探测要求 Status:0" "$(has "$CODE" '"Status":0')"
@@ -1257,7 +1265,7 @@ for pair in \
   "rule_source_behavior.sh:9" \
   "clash_yaml_behavior.sh:41" \
   "egress_behavior.sh:32" \
-  "dnstest_behavior.sh:26"; do
+  "dnstest_behavior.sh:38"; do
   bt="${pair%%:*}"; bmin="${pair##*:}"
   if [ ! -f "test/$bt" ]; then
     fail "缺少行为验证脚本 test/$bt"

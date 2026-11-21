@@ -6709,11 +6709,97 @@ doh_ok(){
   return 1
 }
 
+# 客户端侧自检清单: 纯文本、不带颜色。
+# 不带颜色是有意的 —— 这份内容用户会从终端复制到手机上看, ANSI 转义会跟着
+# 一起粘过去变成乱码。窄行宽也是同一个原因(手机屏幕)。
+print_client_checklist(){
+  local base=""
+  if [ "${SUB_HTTP:-0}" = "1" ] && [ -n "${SUB_TOKEN:-}" ]; then
+    if [ "${SUB_BIND:-127.0.0.1}" = "127.0.0.1" ]; then
+      base="http://127.0.0.1:${SUB_PORT:-}/${SUB_TOKEN}"
+    else
+      base="http://${SERVER_IP}:${SUB_PORT:-}/${SUB_TOKEN}"
+    fi
+  fi
+
+  cat <<TXT
+================= DNS 泄露自检 · 客户端 =================
+
+服务端只能验配置齐全、端点可用。你手机/电脑上到底用了哪个 DNS,
+只有客户端自己知道, 所以这一步必须你亲手做一次。
+
+【订阅地址】(含 token, 等同密码, 别发给任何人)
+TXT
+  if [ -n "$base" ]; then
+    echo "  小火箭 : ${base}/shadowrocket.conf"
+    echo "  Clash  : ${base}/clash.yaml"
+    echo "  v2rayN : ${base}/v2rayn-routed.json"
+  else
+    echo "  未开启 HTTP 订阅。用 FinalShell 文件面板把这三个文件"
+    echo "  下载到本机再导入:"
+    echo "    shadowrocket.conf / clash.yaml / v2rayn-routed.json"
+    echo "  路径: ${SUB_DIR:-/var/www/proxy-sub}/${SUB_TOKEN:-<token>}/"
+  fi
+  cat <<'TXT'
+
+【第 1 步】导入"对的那份"
+  x 不要用 base64.txt / v2rayn.txt 纯链接 —— 它们是纯节点列表,
+    不带任何 DNS 配置, 导入后等于用本地运营商 DNS。
+  x 不要用 singbox.json 跑 Clash, 那是给 sing-box 内核的。
+
+  小火箭 : 用 shadowrocket.conf (配置 -> 添加 -> 从 URL 下载)
+  Clash  : 用 clash.yaml      (Clash Verge / mihomo 内核)
+  v2rayN : 用 v2rayn-routed.json (不是 v2rayn.txt)
+
+【第 2 步】确认开关(漏一个就漏)
+  小火箭 : 设置 -> DNS -> "DNS 覆写" 留空(配置里已带);
+           全局路由 = 配置; 不要开"绕过大陆"以外的自定义规则。
+  Clash  : 模式选"规则"; TUN 模式必须开(UDP 走 TUN 才不漏 WebRTC);
+           不要改成 redir-host(会退回本地解析)。
+  v2rayN : 路由选"使用配置文件"; 内核用 sing-box;
+           别选"绕过大陆"以外的自定义路由。
+
+【第 3 步】跑检测(连上代理之后)
+  1) https://dnsleaktest.com   点 Standard test
+  2) https://ipleak.net        看 DNS Addresses 和 WebRTC 两栏
+  3) https://browserleaks.com/webrtc
+
+【判定】
+  通过 : 解析器只出现 VPS 所在地区的运营商/机房, 且没有你的真实 IP
+  失败 : 出现"中国电信/联通/移动"、"阿里/腾讯 DNS"、你家宽带出口 IP
+
+【失败对照】
+  DNS 里出现国内运营商
+    -> 大概率用了纯链接, 或客户端开了"绕过大陆"以外的直连规则。
+  WebRTC 里出现真实 IP
+    -> Clash 没开 TUN, 或小火箭没开"全局代理"; STUN 拦截没生效。
+  检测站打不开
+    -> 先确认代理本身通(proxy status / proxy selftest), 再查 DNS。
+
+【重要】判定 Google 地区要看出口国家做基准,
+  别看到 google.com.hk 就以为被"送中" —— 香港节点本来就跳香港。
+TXT
+  echo
+  echo "（这份清单可以存下来: proxy dnstest --client > dns-check.txt）"
+}
+
 cmd_dnstest(){
   need_root
   load_state || die "尚未安装"
   local tdir="${SUB_DIR:-/var/www/proxy-sub}/${SUB_TOKEN:-}"
-  local bad=0
+  local bad=0 mode="full" a
+  for a in "$@"; do
+    case "$a" in
+      --client|-c) mode="client" ;;
+      --all|-a)    mode="full" ;;
+    esac
+  done
+  # --client 只输出清单, 不跑服务端检查: 用户可能正在手机上操作,
+  # 只想看"下一步点哪里", 不想再读一遍服务端结论。
+  if [ "$mode" = "client" ]; then
+    print_client_checklist
+    return 0
+  fi
 
   echo
   hr
@@ -8644,7 +8730,8 @@ Proxy Node Installer v${SCRIPT_VERSION} (${BUILD_DATE})
   restart          重启已启用协议对应的服务
   logs [单元]      实时日志: xray(默认) / hy2 / sb
   audit [--dnsbl]  线路体检(出口 IP / PTR / 时间 / 客户端清单)
-  dnstest          DNS 泄露自检: 三端订阅 DNS 配置 / DoH 端点实测 / 出口同源
+  dnstest [--client]  DNS 泄露自检: 三端订阅 DNS 配置 / DoH 端点实测 / 出口同源
+                   --client 只打印客户端侧自检清单(手机可看, 不带颜色)
                    客户端侧(浏览器实际用了哪个 DNS)服务端测不到, 末尾给自查清单
   selftest         逐协议真连一次(用订阅同一份配置), 装完发现不通看这里
   speed            速度体检: BBR / 拥塞控制 / 默认节点 / 该开哪项(只读)
@@ -8738,7 +8825,7 @@ main(){
     restart)        cmd_restart ;;
     logs)           cmd_logs "${2:-xray}" ;;
     audit)          cmd_audit "${2:-}" ;;
-    dnstest|dns)    cmd_dnstest ;;
+    dnstest|dns)    shift || true; cmd_dnstest "$@" ;;
     egress)         cmd_egress "${2:-}" ;;
     selftest|test)  cmd_selftest ;;
     speed|perf)     cmd_speed ;;

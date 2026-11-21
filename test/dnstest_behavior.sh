@@ -21,13 +21,13 @@ FNS="$TD/f.sh"
             render_stun_sr render_stun_clash render_stun_sb_domains \
             hy2_bw_ok effective_default_node sb_tls \
             write_clash_yaml write_shadowrocket_conf write_sb_client \
-            sub_dns_issues doh_ok; do
+            sub_dns_issues doh_ok print_client_checklist; do
     awk -v n="$fn" '$0 ~ "^" n "\\(\\)\\{" {p=1} p{print} p && $0=="}"{exit}' "$SRC"
   done
 } > "$FNS"
 
 NB=$(grep -c '^[a-z_0-9]*(){' "$FNS")
-[ "$NB" -ge 15 ] || { echo "FAIL 函数抽取不完整(只抽到 $NB 个, 应为 15)"; exit 1; }
+[ "$NB" -ge 16 ] || { echo "FAIL 函数抽取不完整(只抽到 $NB 个, 应为 16)"; exit 1; }
 grep -q '^STUN_DOMAINS=' "$FNS" || { echo "FAIL 单一数据源未抽到"; exit 1; }
 bash -n "$FNS" || { echo "FAIL 抽取出的函数语法错误"; exit 1; }
 # 审计函数要在本 shell 里直接调用(生成产物则走独立子 shell), 所以这里 source 一次。
@@ -179,6 +179,36 @@ EOF
 else
   echo "SKIP 没有 python3, 跳过隧道生命周期测试"
 fi
+
+# ---------------------------------------------------------------- --client 清单
+# 这份清单的用途是"从终端复制到手机上看", 所以两件事必须守住:
+#   1) 不能带 ANSI 转义 —— 粘到手机上会变成 [1;32m 之类的乱码;
+#   2) 订阅地址必须跟着 SUB_BIND 走 —— 监听在 127.0.0.1 时给出公网 IP 的
+#      链接, 用户在手机上点开必然连不上, 却会以为是服务坏了。
+CLI1=$(SUB_HTTP=1 SUB_TOKEN=tok123 SUB_PORT=8443 SUB_BIND=0.0.0.0 \
+       SERVER_IP=203.0.113.9 print_client_checklist)
+t "清单给出小火箭地址" "$(printf '%s' "$CLI1" | grep -c 'http://203.0.113.9:8443/tok123/shadowrocket.conf')" 1
+t "清单给出 Clash 地址"  "$(printf '%s' "$CLI1" | grep -c 'http://203.0.113.9:8443/tok123/clash.yaml')" 1
+t "清单给出 v2rayN 地址" "$(printf '%s' "$CLI1" | grep -c 'http://203.0.113.9:8443/tok123/v2rayn-routed.json')" 1
+# ESC(0x1b) 一次都不该出现
+t "清单无 ANSI 转义" \
+  "$(printf '%s' "$CLI1" | od -An -c | grep -c '033')" 0
+t "清单含 dnsleaktest"  "$(printf '%s' "$CLI1" | grep -c 'dnsleaktest.com')" 1
+t "清单含 ipleak"       "$(printf '%s' "$CLI1" | grep -c 'ipleak.net')" 1
+t "清单含 webrtc 检测"  "$(printf '%s' "$CLI1" | grep -c 'browserleaks.com/webrtc')" 1
+t "清单警告别用纯链接"  "$(printf '%s' "$CLI1" | grep -c 'base64.txt')" 1
+
+CLI2=$(SUB_HTTP=1 SUB_TOKEN=tok123 SUB_PORT=8443 SUB_BIND=127.0.0.1 \
+       SERVER_IP=203.0.113.9 print_client_checklist)
+t "本机监听时地址用 127.0.0.1" \
+  "$(printf '%s' "$CLI2" | grep -c 'http://127.0.0.1:8443/tok123/clash.yaml')" 1
+t "本机监听时不写公网 IP" \
+  "$(printf '%s' "$CLI2" | grep -c '203.0.113.9')" 0
+
+CLI3=$(SUB_HTTP=0 SUB_TOKEN=tok123 SUB_PORT=8443 SUB_BIND=0.0.0.0 \
+       SERVER_IP=203.0.113.9 SUB_DIR=/var/www/proxy-sub print_client_checklist)
+t "没开订阅时给文件路径" "$(printf '%s' "$CLI3" | grep -c '/var/www/proxy-sub/tok123/')" 1
+t "没开订阅时不出 URL"   "$(printf '%s' "$CLI3" | grep -c 'http://')" 0
 
 echo "----------------------------------------"
 echo "  PASS $P   FAIL $F"
