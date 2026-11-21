@@ -467,15 +467,16 @@ footer .sep{color:var(--line2)}
 
     var sub = state.mode === "clean" ? "install --clean" : "install";
     var prefix = env.length ? env.join(" ") + " " : "";
-    // 四步: mktemp 随机临时文件 -> 语法校验 -> 原子替换 -> 执行。
+    // 六步: mktemp 随机临时文件 -> 下载 -> 语法校验 -> 复制到正式位置 -> 清临时文件 -> 执行。
     // 不能用固定的 /tmp/pn.sh: /tmp 全局可写, 预置符号链接会让 root 的 curl -o 截断目标。
     // 不能直接 -o 到 /root/setup-proxy.sh: 下载中断会把磁盘上那份能用的脚本顶成半截文件。
-    // 环境变量只作用于最后那一步 bash, 所以放在 mv 之后。
+    // 必须落盘再执行: 脚本用 readlink -f "$0" 找自己, 跑 /tmp 下的文件会把 proxy 软链指到 /tmp。
+    // 环境变量只作用于最后那一步 bash, 所以放在 install 之后。
     // 必须带超时: 目标被阻断时无超时的 curl 会长时间停在"连接中"不给任何输出,
     // 用户以为脚本坏了, 其实还在等一个永远不来的 SYN。
-    return "PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL --connect-timeout 10 --max-time 120 " + REPO + " -o \"$PN_TMP\" && " +
-           "[ -f \"$PN_TMP\" ] && [ ! -L \"$PN_TMP\" ] && bash -n \"$PN_TMP\" && " +
-           "mv -f \"$PN_TMP\" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && " +
+    // 别再往上加保险: 这条命令已经 200 字符出头, 每多一段都在劝退第一次用的人。
+    return "f=$(mktemp)&&curl -fsSL --connect-timeout 10 -m 120 " + REPO + " -o \"$f\"&&" +
+           "bash -n \"$f\"&&install -m755 \"$f\" /root/setup-proxy.sh&&rm \"$f\"&&" +
            prefix + "bash /root/setup-proxy.sh " + sub;
   }
 

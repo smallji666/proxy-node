@@ -76,7 +76,21 @@ SCRIPT_URL="${REPO_URL}/raw/main/setup.sh"
 #   curl 必须带超时。这是用户在新机器上敲的第一条命令: 目标被阻断时, 无超时的
 #   curl 会长时间停在"连接中"不给任何输出, 用户只看到光标闪烁, 以为脚本坏了 ——
 #   而实际上它还在等一个永远不来的 SYN。10s 连不上就该报错退出。
-ONELINER="PN_TMP=\$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL --connect-timeout 10 --max-time 120 ${SCRIPT_URL} -o \"\${PN_TMP}\" && [ -f \"\${PN_TMP}\" ] && [ ! -L \"\${PN_TMP}\" ] && bash -n \"\${PN_TMP}\" && mv -f \"\${PN_TMP}\" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && bash /root/setup-proxy.sh"
+#
+# 这条命令被压到 220 字符左右, 每一段都留了理由, 别再往上加:
+#   f=$(mktemp)                随机名字, 见上(防预置符号链接)
+#   curl ... -o "$f"           下到临时文件, 不碰磁盘上那份能用的
+#   bash -n "$f"               语法过了才允许落到正式位置(防半截文件)
+#   install -m755 "$f" 目标     一步完成复制+权限, 比 mv+chmod 短
+#   rm "$f"                    install 是复制, 不清会每次留一个 200KB 的临时文件
+#   bash 目标                   必须落盘后再执行: 脚本用 readlink -f "$0" 找自己,
+#                              跑 /tmp 下的临时文件会把 proxy 软链指到 /tmp,
+#                              紧接着 cleanup_stale_scripts 就把它清掉了。
+# 已经删掉的两段(都是冗余的, 不是"保险"):
+#   [ -f "$f" ]    curl -f 失败就返回非零, && 链已断; 且 -o 必然创建文件
+#   [ ! -L "$f" ]  mktemp 用 O_EXCL 建的是新文件, 名字随机; /tmp 有 sticky 位,
+#                  同机用户删不掉/换不掉 root 刚建的文件 —— 预置攻击不成立
+ONELINER="f=\$(mktemp)&&curl -fsSL --connect-timeout 10 -m 120 ${SCRIPT_URL} -o \"\$f\"&&bash -n \"\$f\"&&install -m755 \"\$f\" /root/setup-proxy.sh&&rm \"\$f\"&&bash /root/setup-proxy.sh"
 
 # ---------------- 记录用户显式传入的环境变量 ----------------
 # 未传时置为哨兵值, 以便 load_state 之后判断是否需要覆盖

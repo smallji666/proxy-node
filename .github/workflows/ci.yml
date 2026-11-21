@@ -81,8 +81,8 @@ jobs:
           # 只查这一处单一来源, 避免为满足 CI 把文档重新注水。
           grep -qF "当前 **v${ver}**" README.md || { echo "README 当前版本没对齐 v${ver}"; exit 1; }
           grep -q "class=\"badge\">v${ver}" docs/index.html || { echo "docs badge 没对齐"; exit 1; }
-          grep -q 'mktemp /tmp/pn.XXXXXXXXXX' README.md || { echo "README 一键命令没用随机临时文件"; exit 1; }
-          grep -q 'mktemp /tmp/pn.XXXXXXXXXX' docs/index.html || { echo "docs 命令生成器没用随机临时文件"; exit 1; }
+          grep -qF 'f=$(mktemp)' README.md || { echo "README 一键命令没用 mktemp 随机临时文件"; exit 1; }
+          grep -qF 'f=$(mktemp)' docs/index.html || { echo "docs 命令生成器没用 mktemp 随机临时文件"; exit 1; }
           echo "OK: README / docs 对齐 v${ver}"
 
       # 发版字段散落在 setup.sh / README / docs 三处, 以前只查了其中两条。
@@ -121,11 +121,12 @@ jobs:
           if ! awk -v u="$want" 'index($0,u) && index($0,"curl -fsSL") {f=1} END{exit !f}' README.md; then
             echo "README 一键命令里找不到 [curl -fsSL ... ${want}]"; exit 1
           fi
-          # ONELINER 的三道保险不能退化。源码里 \$ / \" 是转义后的字面量,
-          # 一律用 grep -F 精确匹配, 别用 BRE(\( 会被当捕获组)。
-          grep -qF 'ONELINER="PN_TMP=\$(mktemp /tmp/pn.XXXXXXXXXX)' setup.sh || { echo "一键命令没用 mktemp"; exit 1; }
-          grep -qF '[ ! -L \"\${PN_TMP}\" ]' setup.sh || { echo "一键命令缺符号链接检查"; exit 1; }
-          grep -qF 'bash -n \"\${PN_TMP}\"' setup.sh || { echo "一键命令缺语法校验"; exit 1; }
+          # 一键命令的每一段都在挡一种具体失败, 不能退化。源码里 \$ / \" 是转义后的
+          # 字面量, 一律用 grep -F 精确匹配, 别用 BRE(\( 会被当捕获组)。
+          grep -qF 'ONELINER="f=\$(mktemp)&&' setup.sh || { echo "一键命令没用 mktemp 随机文件"; exit 1; }
+          grep -qF 'bash -n \"\$f\"' setup.sh || { echo "一键命令缺语法校验"; exit 1; }
+          grep -qF 'install -m755 \"\$f\" /root/setup-proxy.sh' setup.sh || { echo "一键命令没落到 /root/setup-proxy.sh"; exit 1; }
+          grep -qF 'rm \"\$f\"' setup.sh || { echo "一键命令不清临时文件(install 是复制, 会每次留 200KB)"; exit 1; }
           # 自更新不能只定义 fetch_script_verified 而不调用
           [ "$(grep -c 'if ! fetch_script_verified "$tmp"; then' setup.sh)" -ge 2 ] || {
             echo "maybe_self_update / cmd_update 没有都调用 fetch_script_verified"; exit 1; }

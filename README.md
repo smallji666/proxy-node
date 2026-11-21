@@ -18,10 +18,21 @@
 VPS 上以 **root** 执行：
 
 ```bash
-PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/smallji666/proxy-node/main/setup.sh -o "$PN_TMP" && [ -f "$PN_TMP" ] && [ ! -L "$PN_TMP" ] && bash -n "$PN_TMP" && mv -f "$PN_TMP" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && bash /root/setup-proxy.sh
+f=$(mktemp)&&curl -fsSL --connect-timeout 10 -m 120 https://raw.githubusercontent.com/smallji666/proxy-node/main/setup.sh -o "$f"&&bash -n "$f"&&install -m755 "$f" /root/setup-proxy.sh&&rm "$f"&&bash /root/setup-proxy.sh
 ```
 
-`mktemp` 防符号链接抢占，`bash -n` 先验语法，`mv` 原子落盘。不用 `curl | bash` 是因为要落盘脚本把自己软链成 `proxy` 命令。**云安全组放行 TCP 443 和 UDP 443**（脚本改不了云控制台）。
+这条命令看着长，但每一段都在挡一种具体的失败，删任何一段都会出真问题：
+
+| 片段 | 挡什么 |
+|---|---|
+| `f=$(mktemp)` | `/tmp` 是全局可写目录。用固定名字（如 `/tmp/pn.sh`）时，同机用户能提前把它换成符号链接，以 root 执行的 `curl -o` 就会顺着链接把别的文件截断 |
+| `curl -fsSL --connect-timeout 10 -m 120` | 目标被阻断时，不带超时的 `curl` 会长时间停在"连接中"没有任何输出，用户只看到光标闪，以为脚本坏了 |
+| `-o "$f"` | 下到临时文件，不直接写 `/root/setup-proxy.sh`——下载中断会把磁盘上那份**能用**的脚本顶成半截 |
+| `bash -n "$f"` | 语法过了才允许落到正式位置。半截脚本直接执行，等于把一个能用的版本换成坏的 |
+| `install -m755 … /root/setup-proxy.sh` | 一步完成复制+权限。必须先落盘再执行：脚本用 `readlink -f "$0"` 找自己，跑临时文件会把 `proxy` 软链指到 `/tmp`，紧接着就被清理掉 |
+| `rm "$f"` | `install` 是复制不是移动，不清就每次留一个 200KB 的临时文件 |
+
+不用 `curl | bash`：那样没法先验语法，弱网下会直接执行半截脚本，而且脚本不落盘就建不了 `proxy` 管理命令。**云安全组放行 TCP 443 和 UDP 443**（脚本改不了云控制台）。
 
 向导里可多选（`1 3` / `1,2,5`），回车默认 `Reality+Hysteria2`。跳过向导：`PROTOCOLS=reality,hy2 bash /root/setup-proxy.sh install`。装完信息存 `/root/proxy-info.txt`。
 

@@ -99,14 +99,29 @@ yesno "cmd_name 改备注后 save_state 在 gen_sub_files 之后" "$(awk '
 ' "$SRC")"
 yesno "订阅 unit 用 EnvironmentFile" "$(has "$CODE" 'EnvironmentFile=-${STATE_DIR}/sub.env')"
 yesno "订阅 unit 不再明文写 SUB_TOKEN" "$(no "$CODE" 'Environment=SUB_TOKEN=')"
-yesno "一键命令用 mktemp 随机路径" "$(has "$CODE" 'mktemp /tmp/pn.XXXXXXXXXX')"
-yesno "文档一键命令用 mktemp" "$(has "$(cat README.md)" 'mktemp /tmp/pn.XXXXXXXXXX')"
-yesno "docs 一键命令用 mktemp" "$(has "$(cat docs/index.html)" 'mktemp /tmp/pn.XXXXXXXXXX')"
-# 一键命令是三处手抄的同一串(脚本 ONELINER / README / docs), 任何一处漏了超时,
-# 用户在那条路径上就会看到无限期挂起。三处一起守, 防止下次只改一处。
-yesno "脚本一键命令带超时" "$(has "$CODE" 'curl -fsSL --connect-timeout 10 --max-time 120')"
-yesno "README 一键命令带超时" "$(has "$(cat README.md)" 'curl -fsSL --connect-timeout 10 --max-time 120')"
-yesno "docs 一键命令带超时" "$(has "$(cat docs/index.html)" 'curl -fsSL --connect-timeout 10 --max-time 120')"
+# 一键命令是三处手抄的同一串(脚本 ONELINER / README / docs), 任何一处漏了一段,
+# 用户在那条路径上就会撞上对应的失败。三处一起守, 防止下次只改一处。
+yesno "脚本一键命令用 mktemp 随机文件" "$(has "$CODE" 'ONELINER="f=\$(mktemp)&&')"
+yesno "README 一键命令用 mktemp" "$(has "$(cat README.md)" 'f=$(mktemp)')"
+yesno "docs 一键命令用 mktemp" "$(has "$(cat docs/index.html)" 'f=$(mktemp)')"
+yesno "脚本一键命令带超时" "$(has "$CODE" 'curl -fsSL --connect-timeout 10 -m 120')"
+yesno "README 一键命令带超时" "$(has "$(cat README.md)" 'curl -fsSL --connect-timeout 10 -m 120')"
+yesno "docs 一键命令带超时" "$(has "$(cat docs/index.html)" 'curl -fsSL --connect-timeout 10 -m 120')"
+# 长度闸门。这条命令是用户看到的第一行东西, 每加一道"保险"都在劝退第一次用的人;
+# 而"保险"这个词很容易变成"再加一条也不亏" —— 给它一个上限, 让每次加都有代价。
+# 用真展开(不是数源码字符): 源码里是 ${SCRIPT_URL}, 数它没意义。
+oneliner=$(SCRIPT_URL="https://raw.githubusercontent.com/smallji666/proxy-node/main/setup.sh" \
+  bash -c 'eval "$(grep -m1 "^ONELINER=" setup.sh)"; printf "%s" "$ONELINER"' 2>/dev/null)
+ol_len=${#oneliner}
+# 下界 100 是防 eval 失败拿到空串假绿; 上界 230 是给"以后真需要加一段"留的余量。
+yesno "一键命令长度 ${ol_len} 在 100~230 字符之间" \
+  "$([ "$ol_len" -ge 100 ] && [ "$ol_len" -le 230 ] && echo yes || echo no)"
+# 落盘这一步不能省: 脚本用 readlink -f "$0" 找自己, 跑 /tmp 下的临时文件会把
+# proxy 软链指到 /tmp, 紧接着 cleanup_stale_scripts 就把它清掉。
+yesno "一键命令先 bash -n 再落盘" "$(has "$oneliner" 'bash -n "$f"&&install -m755')"
+yesno "一键命令落到 /root/setup-proxy.sh" "$(has "$oneliner" 'install -m755 "$f" /root/setup-proxy.sh')"
+# install 是复制不是移动: 少了 rm, 每次安装都在 /tmp 留一个 200KB 的脚本副本。
+yesno "一键命令清掉临时文件" "$(has "$oneliner" '&&rm "$f"&&')"
 # CI 里有一道"一键命令 URL 必须等于 REPO_URL 拼出来的那条"的闸门。以前它写的是
 # 死字符串 `curl -fsSL <url>`, 而超时参数正好夹在 -fsSL 和 URL 中间 —— 给三处补
 # 超时时把 CI 打红了, 本地却全绿。这里把 CI 的判定条件同步过来, 同一行里既有
@@ -1241,8 +1256,10 @@ function ck(name, cond, extra){
 
 reset(); P.state.dest = "auto"; P.state.mode = "keep";
 const base = P.build();
-ck("默认命令仍用 mktemp 随机路径", base.indexOf("mktemp /tmp/pn.XXXXXXXXXX") >= 0);
-ck("默认命令仍做 bash -n", base.indexOf('bash -n "$PN_TMP"') >= 0);
+ck("默认命令仍用 mktemp 随机路径", base.indexOf("f=$(mktemp)") >= 0);
+ck("默认命令仍做 bash -n", base.indexOf('bash -n "$f"') >= 0);
+ck("默认命令先验语法再落盘", base.indexOf('bash -n "$f"&&install -m755') >= 0);
+ck("默认命令会清临时文件", base.indexOf('&&rm "$f"') >= 0);
 ck("默认命令落点为 install", /bash \/root\/setup-proxy\.sh install$/.test(base));
 ck("q() 无条件单引号", P.q("abc") === "'abc'", "got="+P.q("abc"));
 ck("q() 转义内部单引号", P.q("a'b") === "'a'\\''b'", "got="+P.q("a'b"));
@@ -1262,7 +1279,7 @@ ck("注入输入被丢弃(REALITY_DEST)", evil.indexOf("REALITY_DEST=") < 0);
 ck("注入输入被丢弃(NODE_NAME)", evil.indexOf("NODE_NAME=") < 0);
 ck("注入输入被丢弃(SUB_PORT)", evil.indexOf("SUB_PORT=") < 0);
 ck("注入输入被丢弃(VLESS_PORT)", evil.indexOf("VLESS_PORT=") < 0);
-ck("注入后命令仍完整可执行", evil.indexOf("mktemp /tmp/pn.XXXXXXXXXX") >= 0);
+ck("注入后命令仍完整可执行", evil.indexOf("f=$(mktemp)") >= 0);
 P.render();
 ck("render 提示参数不合法", store.sum.innerHTML.indexOf("参数不合法") >= 0);
 
@@ -1278,8 +1295,8 @@ elt("subBind").value = "0.0.0.0";
 elt("vlessPort").value = "8443";
 const good = P.build();
 // 环境变量前缀在命令末尾(prefix 只作用于最后那一步 bash), 不在开头。
-// 从 "chmod 755 ... && " 之后截到 "bash /root/setup-proxy.sh" 之前。
-const anchor = "chmod 755 /root/setup-proxy.sh && ";
+// 从落盘+清临时文件那一步之后截到 "bash /root/setup-proxy.sh" 之前。
+const anchor = 'install -m755 "$f" /root/setup-proxy.sh&&rm "$f"&&';
 const tail = good.slice(good.indexOf(anchor) + anchor.length);
 const envPart = tail.slice(0, tail.lastIndexOf("bash /root/setup-proxy.sh"));
 ck("找到 env 前缀锚点", good.indexOf(anchor) >= 0 && tail.lastIndexOf("bash /root/setup-proxy.sh") >= 0);
