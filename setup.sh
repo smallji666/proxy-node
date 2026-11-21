@@ -1667,13 +1667,22 @@ verify_reality(){
 # 为什么不用排行榜动态拉: 安装时必须能离线工作。拉列表这一步一旦要联网, 被墙时
 # 就装不下去了 —— 而"被墙"正是用户来装这个的原因。
 #
-# 规模: 28 个, 不再往上堆。判断标准是"每个都要有真实流量掩护", 不是"越多越分散":
-# 池子只决定"能分散到什么程度", 真正的分散度是 pick_dest 里"每档取前 N 随机"的 N。
-# 池子 28 个 -> 档位 1 约 22 个 -> 取前 7 -> 7 种可能, 和池子 48 个的效果几乎一样,
-# 但安装时少探 20 个站。砍掉的都是流量掩护弱的: 标准组织(ietf / unicode)、
-# 开发者小众站(rust-lang / go.dev)、地区性品牌(acer / philips)、TLS 只到 1.2 的(bing),
-# 以及**套了 Cloudflare 的**(suse / redis / w3 / nodejs) —— 见下面 dest_behind_cf。
-REALITY_DESTS="www.samsung.com www.nvidia.com www.amd.com www.intel.com www.dell.com www.hp.com www.lenovo.com www.asus.com www.sony.com www.ibm.com www.oracle.com www.sap.com www.adobe.com www.autodesk.com www.mathworks.com www.wolfram.com www.mozilla.org www.python.org www.kernel.org www.debian.org www.apache.org www.nginx.com www.postgresql.org www.mysql.com www.mongodb.com www.elastic.co www.ubuntu.com www.fedoraproject.org"
+# 规模: 28 个。下限由分散度倒推: pick_dest 每档取"档内数/3"个随机(上限 8),
+# 要凑满 8 种可能, 档位 1 就得有 24 个候选, 所以池子不能少于 26 左右。再往上加
+# 收益就很小了 —— 分散度由"每档取 N"决定, 不由池子大小决定。
+#
+# 比数量更重要的是**行业铺开**, 这一点最容易被忽略: 池子里如果全是科技公司, 这台
+# 机器长期只跟科技站握手, 就是一个很干净的行业特征 —— 单一特征总比多样特征更容易
+# 被聚类。所以按 硬件(5) / 工业(3) / 汽车(2) / 软件(7) / 数据库(3) / 学术(2) /
+# 消费电子(2) / 发行版(4) 各占一块, 而不是把十个同类大厂堆进去。
+#
+# 选站时实测过三样(TLS 版本 / ALPN / 响应头), 不合格的已经剔掉: 套 CF 的
+# (suse / redis / w3 / nodejs / gitlab / broadcom / ox.ac.uk / acm.org)、
+# TLS 只到 1.2 的(mit.edu / caterpillar)、探测不稳定的(mongodb / mariadb / honeywell)。
+# 证书 SAN 特别大的也剔掉了(oracle 83 / sony 79 / dell 26 / samsung 之外的多数),
+# 不是因为不安全, 而是"一张证书挂几十上百个域名"本身就说明它站在共享基础设施上,
+# 行为不如自有服务器可预测。
+REALITY_DESTS="www.samsung.com www.lenovo.com www.micron.com www.ti.com www.amd.com www.intel.com www.nvidia.com www.bosch.com www.siemens.com www.abb.com www.tesla.com www.toyota.com www.jetbrains.com www.eclipse.org www.docker.com www.mozilla.org www.python.org www.kernel.org www.apache.org www.postgresql.org www.mysql.com www.elastic.co www.ethz.ch www.cam.ac.uk www.nginx.com www.debian.org www.ubuntu.com www.fedoraproject.org"
 # 黑名单: 实测不能用作 REALITY 伪装目标
 # Google 系不能当 dest: 这些域名在国内本身就是被墙的, 正常中国用户不会主动连,
 # GFW 看到 SNI=dl.google.com 反而更容易把连接挑出来。
