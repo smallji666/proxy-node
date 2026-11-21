@@ -1675,14 +1675,27 @@ verify_reality(){
 # 握手能不能淹没在噪音里", 这一条比行业多样和 SAN 大小都重要。SAN 大根本不是
 # 安全风险 —— REALITY 是实时转发握手, 证书特征不影响探测结果。
 #
-# 顺带回答一个常见疑问: 为什么不干脆用 bing / amazon 这种顶级大站?
-#   实测 bing.com 只支持 TLS 1.2(进档位 2, 抗主动探测弱一档);
-#   amazon.com 在国内本身不可达 —— 发 SNI 的那一刻就被拦了, 握手根本到不了 VPS。
-# 这就是现实: 排名 100 以内的站, 要么被墙(google / amazon / facebook / netflix),
-# 要么套 CF(microsoft / apple), 要么只到 TLS 1.2(bing)。能用的最大站就是 59 名的
-# adobe 这一档。
+# 为什么没有 bing / apple / microsoft —— 这三个是所有人第一个想到的站, 逐条实测过,
+# 结论各不相同, 所以理由必须分开写清楚:
+#   bing.com      只协商到 TLS 1.2(实测三次都是 TLSv1.2)。REALITY 要 TLS 1.3, 它进
+#                 档位 2, 抗主动探测弱一档。这是硬性不合格, 没有讨论空间。
+#   apple.com     实测 TLS1.3 + h2 + 自家 CA(Apple Public EV Server RSA CA 4 - G1)
+#                 + SAN 只有 2 个域名 + **不套 CF**(响应头里没有 server/cf-ray)。
+#                 技术上完全合格, 剔掉它的理由不是技术: 几乎所有 REALITY 教程都写它,
+#                 全网几十万节点压在同一个 SNI 上, 它本身就成了指纹。
+#   microsoft.com 同上(自家 CA、SAN 7 个、不套 CF), 理由同上。
+# 之前这里写过"microsoft / apple 套 CF" —— 那是错的, 实测 cf-ray 为 0, 已改正。
+#
+# amazon.com 之前被这里写成"国内不可达" —— 那也是错的, 同一个错:
+#   实测直连返回 503(应用层错误, TCP 与 TLS 都正常建立)、TLS1.3 + h2、
+#   自家 CA(Amazon RSA 2048 M04)、不套 CF —— 四条硬判据全过。
+#   503 只是裸 GET / 被亚马逊拒了, 而 REALITY 只用它的握手, 根本不发 HTTP 请求。
+#   排名 28, 是池子里流量最大的站, 已加入。
+# 真正被墙的是 google / youtube / dropbox 这一类(直连 TCP 就通不了), 那几个绝对不能
+# 当 SNI: 发出去的 ClientHello 会先被拦掉, 握手根本到不了 VPS。
 #
 # 排序按行业分组只是为了好读, 每组内部按排名从高到低:
+#   电商(1):          amazon 28
 #   消费电子/硬件(9): samsung 122 / hp 285 / nvidia 352 / dell 361 / intel 453 /
 #                     asus 715 / lenovo 794 / amd 1114 / sony 2045
 #   企业软件/工业(4): oracle 217 / cisco 240 / autodesk 339 / siemens 1166
@@ -1693,8 +1706,47 @@ verify_reality(){
 #   学术(1):          cam.ac.uk 1526
 # 剔掉的: ibm 与 docker(实测不稳定: 同一台机器上时通时不通)、micron / bosch / abb /
 # eclipse / ethz / ti / toyota(排名 2500~12600, 流量掩护太弱), 以及套 CF / TLS1.2 的
-# 那些。另外几个可惜的: zoom.us 排名 58 但套了 CF; dropbox 排名 130 但国内连不上。
-REALITY_DESTS="www.samsung.com www.hp.com www.nvidia.com www.dell.com www.intel.com www.asus.com www.lenovo.com www.amd.com www.sony.com www.oracle.com www.cisco.com www.autodesk.com www.siemens.com www.adobe.com www.mozilla.org www.apache.org www.ubuntu.com www.debian.org www.python.org www.kernel.org www.jetbrains.com www.fedoraproject.org www.mysql.com www.postgresql.org www.elastic.co www.tesla.com www.cam.ac.uk"
+# 那些。另外两个可惜的: zoom.us 排名 58 但套了 CF; dropbox 排名 130 但国内连不上。
+REALITY_DESTS="www.amazon.com www.samsung.com www.hp.com www.nvidia.com www.dell.com www.intel.com www.asus.com www.lenovo.com www.amd.com www.sony.com www.oracle.com www.cisco.com www.autodesk.com www.siemens.com www.adobe.com www.mozilla.org www.apache.org www.ubuntu.com www.debian.org www.python.org www.kernel.org www.jetbrains.com www.fedoraproject.org www.mysql.com www.postgresql.org www.elastic.co www.tesla.com www.cam.ac.uk"
+
+# 每个伪装目标站"是什么"。为什么要这东西: SNI 是必须一字不差抄进客户端的一行,
+# 而池子里有一半是 www.cam.ac.uk / www.elastic.co / www.fedoraproject.org 这种
+# 普通用户平时不会访问的域名 —— 看到一个陌生域名又没有任何线索, 只能靠猜, 猜错了
+# 也只会得到"连接超时", 不会有人告诉他抄错了。
+# 加池子成员必须在这里补一行: test/run.sh 会逐个检查, 漏了直接判红。
+dest_note(){
+  case "$1" in
+    www.amazon.com)        echo "亚马逊官网" ;;
+    www.samsung.com)       echo "三星电子官网" ;;
+    www.hp.com)            echo "惠普官网" ;;
+    www.nvidia.com)        echo "英伟达官网" ;;
+    www.dell.com)          echo "戴尔官网" ;;
+    www.intel.com)         echo "英特尔官网" ;;
+    www.asus.com)          echo "华硕官网" ;;
+    www.lenovo.com)        echo "联想官网" ;;
+    www.amd.com)           echo "AMD 官网" ;;
+    www.sony.com)          echo "索尼官网" ;;
+    www.oracle.com)        echo "Oracle 数据库厂商官网" ;;
+    www.cisco.com)         echo "思科官网" ;;
+    www.autodesk.com)      echo "Autodesk(AutoCAD 厂商)官网" ;;
+    www.siemens.com)       echo "西门子官网" ;;
+    www.adobe.com)         echo "Adobe(Photoshop 厂商)官网" ;;
+    www.mozilla.org)       echo "Mozilla(Firefox 厂商)官网" ;;
+    www.apache.org)        echo "Apache 软件基金会官网" ;;
+    www.ubuntu.com)        echo "Ubuntu 发行版官网" ;;
+    www.debian.org)        echo "Debian 发行版官网" ;;
+    www.python.org)        echo "Python 官网" ;;
+    www.kernel.org)        echo "Linux 内核官网" ;;
+    www.jetbrains.com)     echo "JetBrains(IDEA 厂商)官网" ;;
+    www.fedoraproject.org) echo "Fedora 发行版官网" ;;
+    www.mysql.com)         echo "MySQL 官网" ;;
+    www.postgresql.org)    echo "PostgreSQL 官网" ;;
+    www.elastic.co)        echo "Elastic(Elasticsearch 厂商)官网" ;;
+    www.tesla.com)         echo "特斯拉官网" ;;
+    www.cam.ac.uk)         echo "剑桥大学官网" ;;
+    *) return 1 ;;
+  esac
+}
 # 黑名单: 实测不能用作 REALITY 伪装目标
 # Google 系不能当 dest: 这些域名在国内本身就是被墙的, 正常中国用户不会主动连,
 # GFW 看到 SNI=dl.google.com 反而更容易把连接挑出来。
@@ -5083,12 +5135,20 @@ EOF
 # 只写当前真正启用的协议: 以前是固定模板, 单开 hy2 时也会出现 VLESS 段,
 # 而 SS2022 / AnyTLS / TUIC 反而完全不出现。
 write_info_file(){
-  local pu="${PRIMARY_UUID:-$UUID}"
+  local pu="${PRIMARY_UUID:-$UUID}" dn
   {
     echo "=========== 节点信息 ==========="
     echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "服务器 IP: ${SERVER_IP}"
     echo "启用协议: ${PROTOCOLS}"
+    # 伪装目标单独一行, 不跟着某个协议走: 所有协议共用同一个 DEST, 只写一次既够用
+    # 又不会在开了四协议时重复四遍。带上"这是什么站", 是因为池子里一半域名普通用户
+    # 不认识, 而这一行抄错只会得到"连接超时", 客户端不会告诉他是 SNI 的问题。
+    if dn=$(dest_note "${DEST:-}" 2>/dev/null); then
+      echo "伪装目标: ${DEST}  (${dn})"
+      echo "          所有协议共用这一个 SNI, 必须与客户端一字不差;"
+      echo "          抄错不会报 SNI 错误, 只会表现为连接超时或握手失败。"
+    fi
     echo
     if proto_on reality; then
       echo "[VLESS + REALITY]  TCP ${VLESS_PORT}"
@@ -5156,6 +5216,15 @@ write_info_file(){
   chmod 600 /root/proxy-info.txt 2>/dev/null || true
 }
 
+# 在 SNI 那一行下面补一句"这是什么站"。终端里是彩色 + 缩进, 和 write_info_file 里
+# 的纯文本版本分开写: 那个要落盘, 不能带转义符。取不到说明就什么都不打(新域名没
+# 补 dest_note 时不会在这里露一个空括号)。
+print_dest_note(){
+  local dn
+  dn=$(dest_note "${DEST:-}" 2>/dev/null) || return 0
+  echo -e "            ${D}(${dn}; 这一行必须与客户端一字不差)${N}"
+}
+
 print_links(){
   echo
   if proto_on reality; then
@@ -5167,6 +5236,7 @@ print_links(){
     echo "UUID      : ${PRIMARY_UUID:-$(primary_uuid)}"
     echo "Flow      : xtls-rprx-vision"
     echo "SNI       : ${DEST}"
+    print_dest_note
     echo "公钥 pbk  : ${PUB}"
     echo "shortId   : ${SID}"
     echo "指纹 fp   : ${REALITY_FP:-chrome}"
@@ -5181,6 +5251,9 @@ print_links(){
     hr
     echo "密码      : ${HY2_PASS}"
     echo "SNI       : ${DEST}"
+    # 只开了 hy2 没开 reality 时才补这一行: 两个都开的话上面 REALITY 段已经说过一次,
+    # 同一个域名连说两遍是噪音。
+    proto_on reality || print_dest_note
     if [ -n "${HY2_PIN:-}" ]; then
       echo -e "证书固定  : ${G}已启用${N} (pinSHA256, 证书 SHA-256)"
       echo "  指纹    : ${HY2_PIN}"

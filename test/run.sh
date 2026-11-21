@@ -247,13 +247,16 @@ yesno "指纹进 STATE_KEYS" "$(has "$(cat "$SRC")" 'DEFAULT_NODE REALITY_FP CER
 yesno "指纹写进 VLESS 链接" "$(has "$CODE" 'sni=${DEST}&fp=${REALITY_FP:-chrome}')"
 yesno "指纹写进 sing-box 订阅" "$(has "$CODE" '"fingerprint": "${REALITY_FP:-chrome}"')"
 yesno "指纹非法回退 chrome" "$(has "$CODE" '不是 Xray 认识的指纹, 已回退 chrome')"
-yesno "伪装站池统一常量" "$(has "$CODE" 'REALITY_DESTS="www.samsung.com')"
+yesno "伪装站池统一常量" "$(has "$CODE" 'REALITY_DESTS="www.amazon.com www.samsung.com')"
 yesno "两处挑选共用池子" "$(has "$CODE" 'cands+=($REALITY_DESTS)')"
 yesno "池子含冷门技术站" "$(has "$CODE" 'www.python.org www.kernel.org')"
 # 主判据是流量排名, 不是"行业铺开"也不是"证书 SAN 小"。上一版反了: 为了行业多样
 # 和 SAN 小, 把 adobe(59) / oracle(217) / cisco(240) 换成了 micron(12595) /
 # bosch(10263) —— 流量掩护反而差了一个量级。这里断言池子里确实留着高排名站。
 yesno "池子含顶级流量站(adobe 59)" "$(has "$CODE" 'www.adobe.com')"
+# amazon(28) 一度被排除, 理由写的是"国内不可达"。实测是错的: 直连 503(应用层),
+# TCP 与 TLS 都正常, TLS1.3 + h2 + 自家 CA + 不套 CF, 四条硬判据全过。
+yesno "池子含 amazon(28, 排名最高的可用站)" "$(has "$CODE" 'www.amazon.com www.samsung.com')"
 yesno "池子含 cisco(240) 与 dell(361)" \
   "$(has "$CODE" 'www.cisco.com www.autodesk.com www.siemens.com')"
 yesno "池子含汽车与学术类(行业不至于单一)" \
@@ -269,6 +272,21 @@ yesno "池子与黑名单无 google" "$(no "$CODE" 'REALITY_DESTS="www.google.co
 dest_n=$(bash -c 'eval "$(grep -m1 "^REALITY_DESTS=" setup.sh)"; set -- $REALITY_DESTS; echo $#' 2>/dev/null)
 yesno "伪装站池在 25~35 个之间(当前 ${dest_n})" \
   "$([ -n "$dest_n" ] && [ "$dest_n" -ge 25 ] && [ "$dest_n" -le 35 ] && echo yes || echo no)"
+# 池子里每个域名都必须有 dest_note 说明。池子一半是 cam.ac.uk / elastic.co /
+# fedora 这种普通用户不认识的域名, 而 SNI 是必须一字不差抄进客户端的一行 ——
+# 看到陌生域名又没有任何线索, 抄错了也只会得到"连接超时"。这条闸门保证以后
+# 往池子里加站的人顺手补上说明, 而不是靠记得。
+note_fn=$(awk '/^dest_note\(\)\{/,/^\}/' "$SRC")
+dest_list=$(bash -c 'eval "$(grep -m1 "^REALITY_DESTS=" setup.sh)"; echo $REALITY_DESTS' 2>/dev/null)
+note_missing=$(bash -c '
+eval "$1"
+shift
+for d in "$@"; do dest_note "$d" >/dev/null 2>&1 || printf "%s " "$d"; done
+' _ "$note_fn" $dest_list 2>/dev/null)
+yesno "池子里每个站都有 dest_note 说明${note_missing:+ (缺: ${note_missing})}" \
+  "$([ -n "$note_fn" ] && [ -z "$note_missing" ] && echo yes || echo no)"
+yesno "info 文件里写出伪装目标与说明" "$(has "$CODE" 'echo "伪装目标: ${DEST}  (${dn})"')"
+yesno "终端 SNI 下面补站点说明" "$(has "$CODE" 'print_dest_note')"
 # 每档取样数必须随档内数量浮动。写死 3 的话池子扩到多少都白扩。
 yesno "每档随机数随档内数量浮动" "$(has "$CODE" 'n_rand=$(( ${#grp[@]} / 3 ))')"
 yesno "每档随机数上限 8" "$(has "$CODE" '[ "$n_rand" -gt 8 ] && n_rand=8')"
