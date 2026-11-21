@@ -471,7 +471,9 @@ footer .sep{color:var(--line2)}
     // 不能用固定的 /tmp/pn.sh: /tmp 全局可写, 预置符号链接会让 root 的 curl -o 截断目标。
     // 不能直接 -o 到 /root/setup-proxy.sh: 下载中断会把磁盘上那份能用的脚本顶成半截文件。
     // 环境变量只作用于最后那一步 bash, 所以放在 mv 之后。
-    return "PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL " + REPO + " -o \"$PN_TMP\" && " +
+    // 必须带超时: 目标被阻断时无超时的 curl 会长时间停在"连接中"不给任何输出,
+    // 用户以为脚本坏了, 其实还在等一个永远不来的 SYN。
+    return "PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL --connect-timeout 10 --max-time 120 " + REPO + " -o \"$PN_TMP\" && " +
            "[ -f \"$PN_TMP\" ] && [ ! -L \"$PN_TMP\" ] && bash -n \"$PN_TMP\" && " +
            "mv -f \"$PN_TMP\" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && " +
            prefix + "bash /root/setup-proxy.sh " + sub;

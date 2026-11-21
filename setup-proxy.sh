@@ -73,7 +73,10 @@ SCRIPT_URL="${REPO_URL}/raw/main/setup.sh"
 #   临时文件必须用 mktemp 的随机名字: /tmp 是 sticky 全局可写目录, 固定名字
 #   /tmp/pn.sh 可以被同机用户预置成符号链接, 以 root 执行的 curl -o 会顺着
 #   链接把目标文件截断。
-ONELINER="PN_TMP=\$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL ${SCRIPT_URL} -o \"\${PN_TMP}\" && [ -f \"\${PN_TMP}\" ] && [ ! -L \"\${PN_TMP}\" ] && bash -n \"\${PN_TMP}\" && mv -f \"\${PN_TMP}\" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && bash /root/setup-proxy.sh"
+#   curl 必须带超时。这是用户在新机器上敲的第一条命令: 目标被阻断时, 无超时的
+#   curl 会长时间停在"连接中"不给任何输出, 用户只看到光标闪烁, 以为脚本坏了 ——
+#   而实际上它还在等一个永远不来的 SYN。10s 连不上就该报错退出。
+ONELINER="PN_TMP=\$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL --connect-timeout 10 --max-time 120 ${SCRIPT_URL} -o \"\${PN_TMP}\" && [ -f \"\${PN_TMP}\" ] && [ ! -L \"\${PN_TMP}\" ] && bash -n \"\${PN_TMP}\" && mv -f \"\${PN_TMP}\" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && bash /root/setup-proxy.sh"
 
 # ---------------- 记录用户显式传入的环境变量 ----------------
 # 未传时置为哨兵值, 以便 load_state 之后判断是否需要覆盖
@@ -388,7 +391,7 @@ ask_yes(){
 #   2) 读取: 只按白名单键逐行解析成纯字符串, **绝不 source / eval**;
 #   3) healthcheck / restore / do_clean 全部走同一套解析, 不留旁路。
 # 格式仍是 KEY='value', 兼容旧安装与备份包。
-STATE_KEYS="INSTALLED_AT XRAY_VERSION NODE_NAME SERVER_IP UUID PRIV PUB SID DEST VLESS_PORT HY2_PORT HY2_PASS ENABLE_OBFS OBFS_PASS HY2_HOP HY2_PIN HY2_INSECURE HY2_BW_UP HY2_BW_DOWN DEFAULT_NODE REALITY_FP CERT_SPKI_B64 CERT_HEX SUB_TOKEN SUB_PORT SUB_BIND SUB_HTTP PROTOCOLS SS2022_PORT ANYTLS_PORT TUIC_PORT SS2022_PASS ANYTLS_PASS TUIC_PASS TUIC_UUID XRAY_BIN_SHA HY2_BIN_SHA SB_BIN_SHA SB_PIN SB_HEX EGRESS_URL"
+STATE_KEYS="INSTALLED_AT XRAY_VERSION NODE_NAME SERVER_IP UUID PRIV PUB SID DEST VLESS_PORT HY2_PORT HY2_PASS ENABLE_OBFS OBFS_PASS HY2_HOP HY2_PIN HY2_INSECURE HY2_BW_UP HY2_BW_DOWN DEFAULT_NODE REALITY_FP CERT_SPKI_B64 CERT_HEX SUB_TOKEN SUB_PORT SUB_BIND SUB_HTTP PROTOCOLS SS2022_PORT ANYTLS_PORT TUIC_PORT SS2022_PASS ANYTLS_PASS TUIC_PASS TUIC_UUID XRAY_BIN_SHA HY2_BIN_SHA SB_BIN_SHA SB_PIN EGRESS_URL"
 
 # 单引号转义: ' -> '\'' ; 换行/回车/制表符统一换成空格, 保证一行一个键。
 sh_quote(){
@@ -438,7 +441,7 @@ safe_state_scalars(){
 # 凭据会直接插进 Clash YAML / sing-box JSON / 分享链接 / systemd unit。
 # 只清控制字符不够: 手改过的 state.env 或旧备份里带引号、空格、分号的值
 # 会写坏配置甚至拼出额外参数。统一在读入后卡死字符集, 非法就丢弃重生成。
-CRED_KEYS="HY2_PASS OBFS_PASS SS2022_PASS ANYTLS_PASS TUIC_PASS TUIC_UUID SB_PIN SB_HEX HY2_PIN CERT_SPKI_B64 CERT_HEX SUB_TOKEN"
+CRED_KEYS="HY2_PASS OBFS_PASS SS2022_PASS ANYTLS_PASS TUIC_PASS TUIC_UUID SB_PIN HY2_PIN CERT_SPKI_B64 CERT_HEX SUB_TOKEN"
 safe_cred_scalars(){
   local k v
   for k in $CRED_KEYS; do
@@ -593,7 +596,6 @@ save_state(){
     state_line HY2_BIN_SHA "${HY2_BIN_SHA:-}"
     state_line SB_BIN_SHA "${SB_BIN_SHA:-}"
     state_line SB_PIN "${SB_PIN:-}"
-    state_line SB_HEX "${SB_HEX:-}"
     state_line EGRESS_URL "${EGRESS_URL:-}"
   } > "$tmp" || { rm -f "$tmp"; die "写入 state.env 失败"; }
   chmod 600 "$tmp"
@@ -1826,8 +1828,10 @@ pick_dest(){
     write_xray_config "$d2"
     $XRAY_BIN run -test -c "$XRAY_CFG" >/dev/null 2>&1 || { warn "$d2 配置校验失败, 跳过"; continue; }
     systemctl restart xray >/dev/null 2>&1
-    sleep 2
-    systemctl is-active --quiet xray || { warn "$d2: xray 启动失败, 跳过"; continue; }
+    # 轮询而不是固定 sleep 2: 慢机器上 xray 绑定端口可能超过 2 秒, 固定等待会把
+    # 一个完全可用的 dest 判成"启动失败"跳掉 —— 而 wait_active 在正常情况下
+    # 0.3 秒就返回, 快机器上反而更快。
+    wait_active xray || { warn "$d2: xray 启动失败, 跳过"; continue; }
     if verify_reality "$d2"; then
       DEST="$d2"
       if [ "$r2" = "?" ]; then
@@ -2180,23 +2184,23 @@ UNIT
   fi
   systemctl enable hysteria-server >/dev/null 2>&1
   systemctl restart hysteria-server >/dev/null 2>&1
-  sleep 2
+  # 全部改成轮询。这里误判的代价不只是"报错": 每判错一级就真的降一级配置 ——
+  # 丢掉 IPv4-only 出站(hy2 会走 v6 出去, 白送一个泄露面)、再丢掉 sniff
+  # (少一层防送中)。一次计时竞态换一次安全降级, 不能接受。
   # sniff 段和 outbounds 都是较新版本才认的。起不来就逐级去掉重写, 而不是让
   # 整个安装失败 —— 少一层防送中 / IPv6 兜底, 和完全没网可用不对等。
   # 先丢 IPv4-only(新加的), 再丢 sniff; 每级都真重启一次确认。
-  if ! systemctl is-active --quiet hysteria-server; then
+  if ! wait_active hysteria-server; then
     warn "带 IPv4-only 出站的 hysteria2 配置未能启动, 去掉该段重试(该版本可能不支持 outbounds)"
     write_hy2_config 1 0
     systemctl restart hysteria-server >/dev/null 2>&1
-    sleep 2
   fi
-  if ! systemctl is-active --quiet hysteria-server; then
+  if ! wait_active hysteria-server; then
     warn "去掉 IPv4-only 后仍起不来, 再去掉 sniff 段重试(该版本可能不支持)"
     write_hy2_config 0 0
     systemctl restart hysteria-server >/dev/null 2>&1
-    sleep 2
   fi
-  systemctl is-active --quiet hysteria-server || die "Hysteria2 未能启动, 查看: journalctl -u hysteria-server -n 30"
+  wait_active hysteria-server || die "Hysteria2 未能启动, 查看: journalctl -u hysteria-server -n 30"
   ok "Hysteria2 运行中, 监听 UDP ${HY2_PORT}"
 
   # 自签证书必须靠指纹固定来验证身份, 否则 insecure 等于对中间人完全敞开。
@@ -2291,11 +2295,14 @@ ensure_sb_cert(){
     make_self_signed_cert "$SB_CERT" "$SB_KEY" "$cn" || die "sing-box 证书生成失败"
   fi
   chmod 600 "$SB_KEY"; chmod 644 "$SB_CERT"
+  # 只要 SPKI 这一种: sing-box 的 TLS 出站固定证书只有
+  # certificate_public_key_sha256 一个字段, 吃的就是公钥 SPKI 的 base64。
+  # 这里以前还多算了一份"整证书 SHA-256 hex"(SB_HEX), 但它在 sing-box 侧
+  # 没有任何对应字段 —— 每次安装白跑一条 openssl 管道, 写进 state.env 占一行,
+  # 列进 CRED_KEYS 每次读状态还要多校验一个值, 全脚本却没人读它。删掉。
   SB_PIN=$(openssl x509 -in "$SB_CERT" -pubkey -noout 2>/dev/null \
     | openssl pkey -pubin -outform der 2>/dev/null \
     | openssl dgst -sha256 -binary | openssl base64 -A)
-  SB_HEX=$(openssl x509 -in "$SB_CERT" -noout -fingerprint -sha256 2>/dev/null \
-    | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
   [ -n "$SB_PIN" ] || warn "sing-box 证书指纹计算失败, 客户端将无法固定校验"
 }
 
@@ -2594,17 +2601,17 @@ UNIT
   fi
   systemctl enable sing-box >/dev/null 2>&1
   systemctl restart sing-box >/dev/null 2>&1
-  sleep 2
-  if ! systemctl is-active --quiet sing-box && [ "$(sb_listen_addr)" = "::" ]; then
+  # 轮询而非固定等待: 误判的代价是把本来能用的 "::" 监听换成 0.0.0.0,
+  # 双栈机器上白白丢掉 IPv6。
+  if ! wait_active sing-box && [ "$(sb_listen_addr)" = "::" ]; then
     # 探测说有 v6, 但 bind("::") 实际失败(容器 / 内核禁用了 v6 socket)。
     # 不回退就是三个协议一起起不来; hy2 侧早就有同类的启动失败回退。
     warn "sing-box 以 :: 监听失败(本机可能没有可用的 IPv6 socket), 改用 0.0.0.0 重试"
     SB_FORCE_V4=1
     write_singbox_config
     systemctl restart sing-box >/dev/null 2>&1
-    sleep 2
   fi
-  systemctl is-active --quiet sing-box \
+  wait_active sing-box \
     || die "sing-box 未能启动, 查看: journalctl -u sing-box -n 30 --no-pager"
   ok "sing-box 运行中: $(sb_port_summary)"
 }
@@ -2625,7 +2632,7 @@ compute_cert_pins(){
   # 它和上面的 SPKI 不是一回事(SPKI 只覆盖公钥, 给 sing-box 用), 两个都要算。
   # 曾经这里只剩 SPKI 一项, CERT_HEX 全脚本没人赋值 —— 于是本函数恒返回失败,
   # ensure_hy2 每次都 die 在"证书指纹计算失败", 默认组合 reality,hy2 直接装不完。
-  # 算法与 SB_HEX 保持一致, 两处不要各写一份。
+  # 算法与 hysteria2 自带的 `hysteria cert` 输出一致(已核对过), 全脚本只有这一份。
   CERT_HEX=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null \
     | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
   # DER 那份从来没被读过, 不再列进成功条件: openssl 偶发失败就整个部署 die 不值得。
@@ -4817,6 +4824,11 @@ class Handler(BaseHTTPRequestHandler):
     # 默认是 HTTP/1.0(每请求一次连接)。1.1 + Content-Length 才能复用连接,
     # 部分订阅客户端对 1.0 响应处理得不好。
     protocol_version = "HTTP/1.1"
+    # 每个连接最多占 30 秒。默认 timeout 是 None —— 只发半行请求就沉默的客户端
+    # 会让线程永远挂在 rfile.readline 上。服务用的是 ThreadingHTTPServer, 一个
+    # 连接一个线程, 几百个半开连接就能把这个进程的内存吃光, 而它监听在公网上。
+    # 超时后标准库自己会关连接(handle_one_request 捕获 TimeoutError), 不必额外处理。
+    timeout = 30
 
     def do_GET(self):
         parts = [p for p in self.path.split("?", 1)[0].split("/") if p]
@@ -4903,8 +4915,9 @@ EOF
   systemctl daemon-reload
   systemctl enable proxy-sub >/dev/null 2>&1
   systemctl restart proxy-sub >/dev/null 2>&1
-  sleep 1
-  if systemctl is-active --quiet proxy-sub; then
+  # python3 冷启动 + ProtectSystem=strict 的沙箱准备, 1 秒经常不够;
+  # 判早了就会打印"启动失败"并给出排错指引, 而服务其实马上就起来了。
+  if wait_active proxy-sub; then
     ok "订阅服务已启动: ${SUB_BIND}:${SUB_PORT}"
     if [ "$SUB_BIND" = "127.0.0.1" ]; then
       echo -e "${D}仅监听本机, 取订阅请先建 SSH 隧道:${N}"
@@ -5180,7 +5193,13 @@ selftest_sb_proto(){
   fi
   "$SB_BIN" run -c "$tmp/c.json" >"$tmp/log" 2>&1 &
   pid=$!
-  sleep 2
+  # 等客户端把 SOCKS 端口监听上再发请求。固定 sleep 2 在慢机器上不够, 而端口
+  # 还没起来时 curl 会立刻拿到 000(连接被拒), 结论却印成"不通" —— 把"还没起来"
+  # 误报成"协议坏了", 方向完全相反。端口一上来就往下走, 正常情况下比 2 秒更快。
+  local _p=0
+  while [ "$_p" -lt 25 ] && ! (exec 3<>/dev/tcp/127.0.0.1/20801) 2>/dev/null; do
+    sleep 0.2; _p=$((_p + 1))
+  done
   rc=$(curl -s --socks5-hostname 127.0.0.1:20801 -o /dev/null -w '%{http_code}' \
        --max-time 12 http://cp.cloudflare.com/generate_204 2>/dev/null)
   kill "$pid" >/dev/null 2>&1
@@ -5448,7 +5467,7 @@ cmd_install(){
     UUID=""; PRIV=""; PUB=""; SID=""; DEST=""
     HY2_PASS=""; OBFS_PASS=""; SUB_TOKEN=""; SERVER_IP=""
     HY2_PIN=""; CERT_SPKI_B64=""; CERT_HEX=""
-    SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""; SB_HEX=""
+    SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""
     fresh=1
   fi
 
@@ -5561,8 +5580,8 @@ cmd_install(){
   if proto_on reality; then
     write_xray_config "$DEST"
     systemctl restart xray >/dev/null 2>&1
-    sleep 2
-    if ! systemctl is-active --quiet xray; then
+    # 轮询: 这里误判的代价是整台机器装到一半 die 掉, 而配置完全正常。
+    if ! wait_active xray; then
       owner=$(port_owner "$VLESS_PORT" tcp) || owner=""
       if [ -n "$owner" ]; then
         die "Xray 启动失败: TCP ${VLESS_PORT} 被 ${owner} 占用。执行 bash $(basename "$0") install --clean 清理后重装, 或换端口: VLESS_PORT=8443 bash $(basename "$0") install"
@@ -6393,10 +6412,13 @@ cmd_restart(){
   sb_enabled       && svcs+=(sing-box)
   [ ${#svcs[@]} -gt 0 ] || die "没有已启用的协议, 先执行: proxy wizard"
   systemctl restart "${svcs[@]}" 2>/dev/null
-  sleep 2
+  # 逐个轮询, 不用固定等待: 慢机器上会误报"有服务未启动", 用户照着提示去翻日志,
+  # 日志里什么都没有。
+  for s in "${svcs[@]}"; do
+    wait_active "$s" || bad=1
+  done
   for s in "${svcs[@]}"; do
     printf '  %-16s : %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"
-    systemctl is-active --quiet "$s" || bad=1
   done
   if [ "$bad" = "1" ]; then
     warn "有服务未启动, 查看: proxy logs <xray|hy2|sb>"
@@ -7334,9 +7356,10 @@ reload_after_user_change(){
     write_singbox_config
     systemctl restart sing-box >/dev/null 2>&1
   fi
-  sleep 2
-  proto_on reality && { systemctl is-active --quiet xray || bad=1; }
-  sb_enabled       && { systemctl is-active --quiet sing-box || bad=1; }
+  # 两个服务都重启完之后再分别轮询(而不是固定等 2 秒一起看): 慢机器上
+  # 会误报"内核重载异常", 让用户以为增删设备没生效。
+  proto_on reality && { wait_active xray || bad=1; }
+  sb_enabled       && { wait_active sing-box || bad=1; }
   # 订阅也要跟着重生成: 主凭据就是订阅里那一条, 增删设备后不刷新的话,
   # 新设备导入订阅看不到自己, 删掉主设备后订阅还留着旧 UUID。
   # 每次 proxy user 都是新进程, load_state 只从 state.env 逐行读键, 里面没有
@@ -7641,8 +7664,7 @@ cmd_restore(){
     ensure_xray_service
     write_xray_config "$DEST"
     systemctl restart xray >/dev/null 2>&1
-    sleep 2
-    systemctl is-active --quiet xray || die "xray 启动失败, 查看: journalctl -u xray -n 30"
+    wait_active xray || die "xray 启动失败, 查看: journalctl -u xray -n 30"
   fi
   if proto_on hy2; then
     ensure_hy2
@@ -7657,8 +7679,7 @@ cmd_restore(){
     write_singbox_config
     ensure_singbox_service
     systemctl restart sing-box >/dev/null 2>&1
-    sleep 2
-    systemctl is-active --quiet sing-box || die "sing-box 启动失败, 查看: journalctl -u sing-box -n 30"
+    wait_active sing-box || die "sing-box 启动失败, 查看: journalctl -u sing-box -n 30"
   fi
   setup_firewall
   install_healthcheck
@@ -7741,7 +7762,7 @@ cmd_reset(){
   _reset_svc_snapshot || die "无法备份当前服务配置, 重置已取消"
   trap _reset_rollback EXIT
   UUID=""; PRIV=""; PUB=""; SID=""; HY2_PASS=""; OBFS_PASS=""; DEST=""
-  SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""; SB_HEX=""
+  SS2022_PASS=""; ANYTLS_PASS=""; TUIC_PASS=""; TUIC_UUID=""; SB_PIN=""
   HY2_PIN=""; CERT_SPKI_B64=""; CERT_HEX=""
   rm -f "$USERS_FILE"
   save_state
@@ -7755,8 +7776,8 @@ cmd_reset(){
   if proto_on reality; then
     pick_dest || die "目标站选择失败"
     write_xray_config "$DEST"
-    systemctl restart xray >/dev/null 2>&1; sleep 2
-    systemctl is-active --quiet xray || die "xray 重启失败, 查看: journalctl -u xray -n 30"
+    systemctl restart xray >/dev/null 2>&1
+    wait_active xray || die "xray 重启失败, 查看: journalctl -u xray -n 30"
   elif proto_on hy2 || proto_on anytls || proto_on tuic; then
     pick_dest_simple
   fi
@@ -7768,8 +7789,8 @@ cmd_reset(){
     ensure_sb_cert
     ensure_sb_creds
     write_singbox_config
-    systemctl restart sing-box >/dev/null 2>&1; sleep 2
-    systemctl is-active --quiet sing-box || die "sing-box 重启失败, 查看: journalctl -u sing-box -n 30"
+    systemctl restart sing-box >/dev/null 2>&1
+    wait_active sing-box || die "sing-box 重启失败, 查看: journalctl -u sing-box -n 30"
   fi
   save_state
   gen_links; gen_sub_files; maybe_sub_http; save_state
@@ -8196,8 +8217,7 @@ cmd_upgrade(){
     cp -f "${XRAY_BIN}.prev" "$XRAY_BIN" \
       || die "回滚失败: 无法覆盖 ${XRAY_BIN} (磁盘满/权限?), 当前二进制未改动"
     systemctl start xray >/dev/null 2>&1
-    sleep 2
-    systemctl is-active --quiet xray || die "回滚后启动失败, 查看: journalctl -u xray -n 30"
+    wait_active xray || die "回滚后启动失败, 查看: journalctl -u xray -n 30"
     # 二进制换了, 安装时记的基准哈希就过期了。不同步的话, 下一次 proxy verify
     # 会报"二进制被改动, 可能被人替换" —— 自己升级造成的假警报, 比真报警更糟
     XRAY_BIN_SHA=$(file_sha256 "$XRAY_BIN")
@@ -8260,13 +8280,13 @@ cmd_upgrade(){
   install -m 755 "$tmp/pkg/xray" "$XRAY_BIN"
   rm -rf "$tmp"
   systemctl start xray >/dev/null 2>&1
-  sleep 2
-  if ! systemctl is-active --quiet xray; then
+  # 这里误判的代价最大: 一个完全可用的新版本会被判成"启动失败"然后回滚,
+  # 用户看到的是升级失败, 实际上什么都没坏。轮询到底再下结论。
+  if ! wait_active xray; then
     warn "新版本启动失败, 尝试回滚"
     if [ -x "${XRAY_BIN}.prev" ] && cp -f "${XRAY_BIN}.prev" "$XRAY_BIN" 2>/dev/null; then
       systemctl start xray >/dev/null 2>&1
-      sleep 2
-      if systemctl is-active --quiet xray; then
+      if wait_active xray; then
         XRAY_BIN_SHA=$(file_sha256 "$XRAY_BIN")
         update_state_kv XRAY_BIN_SHA "$XRAY_BIN_SHA"
         local rv2

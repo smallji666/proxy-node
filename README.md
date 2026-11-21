@@ -18,7 +18,7 @@
 VPS 上以 **root** 执行：
 
 ```bash
-PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL https://raw.githubusercontent.com/smallji666/proxy-node/main/setup.sh -o "$PN_TMP" && [ -f "$PN_TMP" ] && [ ! -L "$PN_TMP" ] && bash -n "$PN_TMP" && mv -f "$PN_TMP" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && bash /root/setup-proxy.sh
+PN_TMP=$(mktemp /tmp/pn.XXXXXXXXXX) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/smallji666/proxy-node/main/setup.sh -o "$PN_TMP" && [ -f "$PN_TMP" ] && [ ! -L "$PN_TMP" ] && bash -n "$PN_TMP" && mv -f "$PN_TMP" /root/setup-proxy.sh && chmod 755 /root/setup-proxy.sh && bash /root/setup-proxy.sh
 ```
 
 `mktemp` 防符号链接抢占，`bash -n` 先验语法，`mv` 原子落盘。不用 `curl | bash` 是因为要落盘脚本把自己软链成 `proxy` 命令。**云安全组放行 TCP 443 和 UDP 443**（脚本改不了云控制台）。

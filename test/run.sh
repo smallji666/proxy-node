@@ -94,6 +94,11 @@ yesno "订阅 unit 不再明文写 SUB_TOKEN" "$(no "$CODE" 'Environment=SUB_TOK
 yesno "一键命令用 mktemp 随机路径" "$(has "$CODE" 'mktemp /tmp/pn.XXXXXXXXXX')"
 yesno "文档一键命令用 mktemp" "$(has "$(cat README.md)" 'mktemp /tmp/pn.XXXXXXXXXX')"
 yesno "docs 一键命令用 mktemp" "$(has "$(cat docs/index.html)" 'mktemp /tmp/pn.XXXXXXXXXX')"
+# 一键命令是三处手抄的同一串(脚本 ONELINER / README / docs), 任何一处漏了超时,
+# 用户在那条路径上就会看到无限期挂起。三处一起守, 防止下次只改一处。
+yesno "脚本一键命令带超时" "$(has "$CODE" 'curl -fsSL --connect-timeout 10 --max-time 120')"
+yesno "README 一键命令带超时" "$(has "$(cat README.md)" 'curl -fsSL --connect-timeout 10 --max-time 120')"
+yesno "docs 一键命令带超时" "$(has "$(cat docs/index.html)" 'curl -fsSL --connect-timeout 10 --max-time 120')"
 yesno "TUIC 不再被当 TCP+UDP 放行" "$(no "$CODE" '${TUIC_PORT}/tcp')"
 yesno "sysctl -p 返回码被接住" "$(has "$CODE" 'sysctl -p /etc/sysctl.d/99-proxy-optimize.conf 2>&1); sysrc=$?')"
 yesno "sysctl 逐项回读" "$(has "$CODE" 'sysctl -n "$k"')"
@@ -469,6 +474,23 @@ yesno "apply_egress 验活 REALITY" \
 yesno "apply_egress 验活 sing-box" \
   "$([ "$(awk '/^apply_egress\(\)\{/,/^}/' "$SRC" | grep -c 'wait_active sing-box')" = 1 ] && echo yes || echo no)"
 yesno "服务就绪用轮询不用死等" "$(has "$CODE" 'wait_active(){')"
+# 固定 sleep 后立刻判活是一类系统性缺陷, 不是个别笔误: 慢机器上服务还没绑定
+# 端口就被判"启动失败", 代价分别是 —— 安装中途 die / 回滚一次成功的升级 /
+# 白丢 IPv4-only 与 sniff 两层防护 / 误报"内核重载异常"。
+# 这里扫全文: 任何 `sleep N` 之后两行内出现 is-active 都算回归。
+fixedwait=$(awk '
+  { L[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      if (L[i] !~ /^[[:space:]]*sleep[[:space:]]+[0-9]/) continue
+      if (L[i] ~ /^[[:space:]]*#/) continue
+      for (j = i + 1; j <= i + 2 && j <= NR; j++)
+        if (L[j] ~ /systemctl is-active/ && L[j] !~ /^[[:space:]]*#/) printf "%d ", i
+    }
+  }
+' "$SRC")
+yesno "没有固定等待后直接判活${fixedwait:+ (行:${fixedwait})}" \
+  "$([ -z "$fixedwait" ] && echo yes || echo no)"
 yesno "egress 失败会回滚旧出口" "$(has "$CODE" 'EGRESS_URL="$old_egress"')"
 yesno "egress 端口做范围校验" "$(has "$CODE" '-gt 65535')"
 yesno "egress 探测有备用端点" "$(has "$CODE" 'for ep in https://api.ipify.org https://ifconfig.me')"
@@ -523,6 +545,26 @@ for _ck in $(sed -n 's/^CRED_KEYS="\(.*\)"/\1/p' "$SRC"); do
 done
 yesno "凭据键都有真实赋值来源${cred_noassign:+ (缺:${cred_noassign})}" \
   "$([ -z "$cred_noassign" ] && echo yes || echo no)"
+
+# state.env 三方闭合: STATE_KEYS(白名单) == save_state 写入 == 真的有人读。
+# 多写少读 = 死字段(每次安装白算一遍、白占一行、白多校验一个值);
+# 少写多读 = 读回来永远是空值(配置里少一行, 客户端连不上)。
+# 实际抓到过 SB_HEX: 算了、写了、进了 CRED_KEYS, 全脚本却没人读。
+st_save=$(awk '/^save_state\(\)\{/,/^}/' "$SRC" | sed -n 's/^[[:space:]]*state_line \([A-Za-z_0-9]*\) .*/\1/p' | sort -u)
+st_keys=$(sed -n 's/^STATE_KEYS="\(.*\)"/\1/p' "$SRC" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+t "STATE_KEYS 与 save_state 写入一致" "$(printf '%s\n' "$st_keys")" "$(printf '%s\n' "$st_save")"
+# 读的地方要把 save_state / load_state 两段排除掉, 否则它们自己就算"读过"。
+st_read=$(awk '
+  /^(save_state|load_state)\(\)\{/ { skip=1 }
+  skip && /^\}/ { skip=0; next }
+  !skip { print }
+' "$SRC" | grep -oE '\$\{?[A-Z_][A-Z_0-9]*' | sed 's/^\${*//' | sort -u)
+st_dead=""
+for _k in $st_keys; do
+  printf '%s\n' "$st_read" | grep -qx "$_k" || st_dead="${st_dead} ${_k}"
+done
+yesno "状态字段都有读取方(无只写不读)${st_dead:+ (残留:${st_dead})}" \
+  "$([ -z "$st_dead" ] && echo yes || echo no)"
 
 # ---- 死代码: 定义了却没有任何调用点的函数 ----
 # 精简是硬要求, 而"重构后忘了删旧函数"是最容易积累的一类。这里数引用次数:
@@ -850,7 +892,7 @@ if [ -n "$PY" ]; then
     # main() 不会自动跑), 线程起 ThreadingHTTPServer, http.client 发未经
     # 规范化的原始路径(等价 curl --path-as-is), 结束前 shutdown, 不留孤儿进程。
     cat > "$TD/sub_test.py" <<'PYTEST'
-import http.client, importlib.util, os, sys, threading
+import http.client, importlib.util, os, socket, sys, threading, time
 
 root, src = sys.argv[1], sys.argv[2]
 os.environ["SUB_ROOT"] = root
@@ -898,6 +940,39 @@ alive = status("/tok123/clash.yaml") == 200
 print("PASS 订阅服务确实起来了(桩可用)" if alive else "FAIL 订阅服务没响应(桩坏了)")
 if not alive:
     bad += 1
+
+# 半开连接防护。ThreadingHTTPServer 一个连接一个线程, 而 BaseHTTPRequestHandler
+# 的 timeout 默认是 None: 只连不发字节的客户端会让线程永远挂在 readline 上,
+# 几百个就能吃光这个公网进程的内存。产品里是 30 秒, 这里用 1 秒的子类实测机制
+# 真的生效 —— 只断言"属性被设了"证明不了标准库会照它关连接。
+tmo = getattr(mod.Handler, "timeout", None)
+print("PASS 订阅服务设置了连接超时(%s 秒)" % tmo if tmo else "FAIL 订阅服务没有连接超时")
+if not tmo:
+    bad += 1
+
+class Fast(mod.Handler):
+    timeout = 1
+
+srv2 = mod.ThreadingHTTPServer(("127.0.0.1", 0), Fast)
+p2 = srv2.server_address[1]
+threading.Thread(target=srv2.serve_forever, daemon=True).start()
+sock = socket.create_connection(("127.0.0.1", p2), timeout=6)
+sock.settimeout(6)
+t0 = time.time()
+try:
+    closed = sock.recv(100) == b""
+except Exception:
+    closed = False
+el = time.time() - t0
+sock.close()
+srv2.shutdown()
+srv2.server_close()
+ok_half = closed and el < 5
+print(("PASS 半开连接被超时关闭 (%.1fs)" % el) if ok_half
+      else ("FAIL 半开连接没被关闭 (%.1fs)" % el))
+if not ok_half:
+    bad += 1
+
 srv.shutdown()
 srv.server_close()
 sys.exit(1 if bad else 0)
