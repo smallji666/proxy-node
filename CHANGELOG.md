@@ -362,4 +362,21 @@
 #     - proxy dest / proxy dest list: 看当前用的是哪个站、池子里还有哪些可选;
 #     - proxy info 与 /root/proxy-info.txt 里 SNI 旁边标出站点说明 + "抄错的表现";
 #     - 用户自定义 REALITY_DEST 时查不到说明就不写括号, 但"必须一字不差"照常提示。
+# 修订 33: 池子定稿 18 个 —— 剔掉 bing, 不加 amazon。
+#   用户说"不一定要 bing 和 amazon, 你要留那些好的, 这两个不好用的话就别加了"。
+#   按实测判定:
+#     bing   只到 TLS1.2(三次实测), 进档位 2, 而档位 1 有 18 个候选 —— 永远轮不到
+#            它。留一个永远选不到的站, 只会让"池子里全是 TLS1.3"变成假话, 还得在
+#            每个文档里加一句例外。剔掉。
+#     amazon 四条硬判据全过(TLS1.3 + h2 三次、自家 CA、不套 CF、国内直连可建立),
+#            但加它不增加任何分散度: N = 档内数量/3 且上限 8, 18 个时 N=6, 加一个
+#            还是 6。既然用户不坚持, 就不为凑数加。
+#   顺带查清一个容易被误判的事实: 池子里 13 个站是 **Akamai 边缘**(nvidia / ibm /
+#   tesla / adobe / oracle / dell / hp / intel / mozilla / python / kernel / apache /
+#   mysql), amazon 是 AWS CloudFront 边缘 —— "CDN 边缘终止 TLS"在这个池子里是常态,
+#   不是缺陷。真正要避开的只有 Cloudflare 一家, 因为它的 IP 段被代理滥用的程度是
+#   另一个量级。dest_behind_cf 只认 server: cloudflare / cf-ray, 不误伤 Akamai 和
+#   CloudFront, 这是有意的 —— 别"顺手"把判据扩大成"凡是 CDN 都拦", 那会一次
+#   误伤 13 个站。
+#   proxy dest 列表末尾的总结相应改回"全部 TLS1.3 + h2"(池子里没有例外了)。
 ```

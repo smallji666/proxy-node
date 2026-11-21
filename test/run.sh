@@ -253,16 +253,24 @@ yesno "池子含冷门技术站" "$(has "$CODE" 'www.python.org www.kernel.org')
 # 这一版是**回退到最初那 20 个**(用户要求: 他认得这些站), 只剔了套 CF 的 suse。
 # 闸门守两件事: (1) 最初那批站别又被"优化"掉; (2) suse 别被加回来。
 yesno "池子含顶级流量站(adobe 59)" "$(has "$CODE" 'www.adobe.com')"
+# amazon(28) 硬判据全过, 但没进池子: 加它不改变分散度(N = 档内数量/3, 18 个时是 6,
+# 加一个还是 6), 用户也说"不好用就别加"。这条闸门防的是有人拿排名当理由又塞回去 ——
+# 要加就先说明分散度怎么变。
+yesno "amazon 没进池子(加它不增加分散度)" "$(no "$CODE" 'REALITY_DESTS="www.amazon.com')"
+# $CODE 是去掉整行注释后的源码, 查注释要用原文。
+# 池子里 13 个站是 Akamai 边缘, amazon 是 CloudFront —— "CDN 边缘终止 TLS"是常态。
+# 这条闸门守的是"别把 CF 判据扩大成'凡是 CDN 都拦'", 那会把 13 个站一起误伤。
+yesno "注释里写明 Akamai 是常态(别扩大 CF 判据)" "$(has "$(cat "$SRC")" 'Akamai 边缘')"
 # nginx(104) / ibm(282) 曾被"行业重挑"和一次探测失败误伤, 排名比池子一半的站都高。
 yesno "池子含 nginx(104)" "$(has "$CODE" 'www.apache.org www.nginx.com www.postgresql.org')"
 yesno "池子含 ibm(282)" "$(has "$CODE" 'www.amd.com www.ibm.com www.tesla.com')"
 yesno "池子含 dell/hp/intel(硬件大厂)" \
   "$(has "$CODE" 'www.oracle.com www.dell.com www.hp.com www.intel.com')"
 yesno "池子含 tesla" "$(has "$CODE" 'www.tesla.com www.adobe.com')"
-# bing 只到 TLS1.2, 会进档位 2; 用户要求保留, 那就保留 —— 但必须同时在 dest_note
-# 里标出这一点, 否则等于假装它和其他站一样。
-yesno "池子含 bing(用户要求, 标注为备选档)" "$(has "$CODE" 'www.mysql.com www.bing.com')"
-yesno "bing 的说明里写了 TLS1.2 备选档" "$(has "$CODE" '只到 TLS1.2, 排在备选档')"
+# bing 只到 TLS1.2, 会进档位 2, 而档位 1 有 18 个候选 —— 永远选不到。留一个永远
+# 选不到的站只会让"池子里全是 TLS1.3"变成假话, 还得在每个文档里加例外。所以剔掉。
+yesno "只到 TLS1.2 的 bing 不在池子里" "$(no "$CODE" 'www.mysql.com www.bing.com')"
+yesno "注释里写了 bing 的剔除理由" "$(has "$(cat "$SRC")" '只协商到 TLS 1.2')"
 # suse 套 CF(实测 Server: cloudflare + CF-RAY), 用户自己定的规则是"千万不能套 CF"。
 yesno "套 CF 的 suse 没在池子里" "$(no "$CODE" 'www.debian.org www.suse.com')"
 yesno "池子与黑名单无 google" "$(no "$CODE" 'REALITY_DESTS="www.google.com')"
@@ -294,9 +302,9 @@ yesno "终端 SNI 下面补站点说明" "$(has "$CODE" 'print_dest_note')"
 yesno "dest 子命令已注册" "$(has "$CODE" 'dest)           cmd_dest')"
 yesno "proxy dest 会列出整个池子" "$(has "$CODE" '伪装目标候选池')"
 yesno "proxy dest 给了换站命令" "$(has "$CODE" 'REALITY_DEST=www.oracle.com bash /root/setup-proxy.sh install')"
-# 池子里有 bing(只到 TLS1.2)这种例外, 所以列表末尾不能说"全部 TLS1.3 + h2" ——
-# 一句不准确的总结比没有总结更糟: 用户会以为 bing 和别的站一样强。
-yesno "proxy dest 的总结没有夸大(区分备选档)" "$(has "$CODE" '除标注了备选档的, 均为 TLS 1.3')"
+# 池子里没有例外了, 列表末尾可以直说"全部 TLS1.3 + h2"。以前有 bing 时这里必须
+# 加限定语 —— 一句不准确的总结比没有总结更糟。
+yesno "proxy dest 的总结与池子一致" "$(has "$CODE" '全部实测: TLS 1.3 + ALPN h2')"
 yesno "proxy dest 在帮助里" "$(has "$CODE" 'dest [list]      查看当前伪装目标站')"
 # 每档取样数必须随档内数量浮动。写死 3 的话池子扩到多少都白扩。
 yesno "每档随机数随档内数量浮动" "$(has "$CODE" 'n_rand=$(( ${#grp[@]} / 3 ))')"

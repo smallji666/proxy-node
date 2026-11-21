@@ -1667,23 +1667,35 @@ verify_reality(){
 # 为什么不用排行榜动态拉: 安装时必须能离线工作。拉列表这一步一旦要联网, 被墙时
 # 就装不下去了 —— 而"被墙"正是用户来装这个的原因。
 #
-# 规模: 19 个 = 最初那 20 个里除 suse 之外的全部。
+# 规模: 18 个 = 最初那 20 个里剔掉 suse 和 bing 之后的全部。
 #
-# 这一版是**回退**, 理由写在这里, 免得以后有人又"优化"回去:
-#   用户明确要求先用最初那 20 个 —— 这些站他认得, 装完看到 www.oracle.com 而不是
-#   www.cam.ac.uk, 心里有底。这个诉求是合理的: SNI 是要一字不差抄进客户端的东西,
-#   认不出来的域名会让人怀疑自己是不是被坑了。安全性本身不取决于用户是否听过,
-#   但"能核对"这件事有独立价值 —— 见下面 dest_note。
+# 这一版是**回退 + 清理**, 理由写在这里, 免得以后有人又"优化"回去:
+#   用户要求先用最初那 20 个 —— 这些站他认得, 装完看到 www.oracle.com 而不是
+#   www.cam.ac.uk, 心里有底。SNI 是要一字不差抄进客户端的东西, 认不出来的域名
+#   会让人怀疑自己被坑了。安全性本身不取决于用户是否听过, 但"能核对"有独立价值
+#   —— 见下面 dest_note。
 #
-# 20 个里只剔了 suse, 两个理由都是实测的:
-#   1) 套 CF: 响应头 Server: cloudflare + CF-RAY(实测三次)。CF 的 IP 段被大量代理
-#      和 VPN 占用, 是最容易被整体标记的一类 —— 用户自己也定了"千万不能套 CF"。
-#   2) 握手不稳: 有一轮三次探测全失败(后来复测 3/3 又正常)。这种时通时不通的站
-#      不该进池子 —— 节点装完能不能用, 不该赌目标站当时的状态。
+# 剔掉的两个, 理由都是实测的:
+#   suse  套 CF: 响应头 Server: cloudflare + CF-RAY(实测三次)。CF 的 IP 段被大量
+#         代理和 VPN 占用, 是最容易被整体标记的一类 —— 用户自己也定了"千万不能套 CF"。
+#         它还有一轮三次探测全失败(复测 3/3 又正常), 时通时不通。
+#   bing  只协商到 TLS 1.2(实测三次都是 TLSv1.2)。REALITY 要 TLS 1.3, dest_rank 会
+#         把它判进档位 2, 而档位 1 有 18 个候选 —— 实际永远轮不到它。用户说过
+#         "不好用就别加了", 所以不留它在池子里凑数: 一个永远选不到的站, 只会让
+#         "池子里全部是 TLS1.3" 这句话变成假的, 还得在每个文档里加一句例外。
 #
-# bing 按用户要求放回去了, 但要知道它站在什么位置: 只协商到 TLS 1.2(实测三次都是
-# TLSv1.2), dest_rank 会把它判进档位 2。档位 1 有 18 个候选, 所以实际上永远轮不到
-# 它 —— 留着不影响安全, 只是让"池子里有 bing"这件事成立, 不再需要为此争论。
+# amazon 也没加, 但不是因为"不合格":
+#   实测 TLS1.3 + h2(三次)、自家 CA(Amazon RSA 2048 M04)、不套 CF、国内直连可建立
+#   (根路径 503 是应用层拒绝, 而 REALITY 只用握手, 不发 HTTP), 四条硬判据全过。
+#   不加的理由是**加了没有任何收益**: 分散度由"每档取前 N 随机"决定, N = 档内数量/3
+#   且上限 8; 18 个时 N=6, 加一个还是 6 —— 只是让"池子里有 amazon"这件事成立而已。
+#   顺带记一个容易被误判的事实: www.amazon.com 的 TLS 是 AWS CloudFront 边缘终止的
+#   (Via: ...cloudfront.net / X-Amz-Cf-Id), 而池子里 13 个站是 Akamai 边缘
+#   (nvidia / ibm / tesla / adobe / oracle / dell / hp / intel / mozilla / python /
+#   kernel / apache / mysql)。也就是说"CDN 边缘终止 TLS"在这个池子里是常态, 不是
+#   缺陷 —— 真正要避开的只有 Cloudflare 一家, 因为它的 IP 段被代理滥用的程度是
+#   另一个量级。dest_behind_cf 只认 Cloudflare(server: cloudflare / cf-ray), 不会
+#   误伤 Akamai / CloudFront, 这是有意的, 别"顺手"把判据扩大。
 #
 # 为什么没有 apple / microsoft(用户反复问过, 一并记在这里):
 #   两家实测都是 TLS1.3 + h2 + 自家 CA + 不套 CF(cf-ray 为 0), 技术上完全合格。
@@ -1697,11 +1709,11 @@ verify_reality(){
 # 剔站之前至少串行复测 3 次: 国内网络跑并发探测会大量超时, 单次失败不足以判定一个
 # 站不合格(nginx 和 ibm 就是被这样误伤过一次, 后来各测 5 次都是 5/5)。
 #
-# 排名(Tranco, 2026-11 实测): bing 45 / adobe 59 / mozilla 92 / nginx 104 /
-#   samsung 122 / apache 140 / oracle 217 / ibm 282 / hp 285 / debian 325 / nvidia 352 /
-#   dell 361 / intel 453 / mysql 539 / python 742 / tesla 1105 / amd 1114 /
-#   postgresql 1161 / kernel 1272
-REALITY_DESTS="www.samsung.com www.nvidia.com www.amd.com www.ibm.com www.tesla.com www.adobe.com www.oracle.com www.dell.com www.hp.com www.intel.com www.mozilla.org www.python.org www.kernel.org www.debian.org www.apache.org www.nginx.com www.postgresql.org www.mysql.com www.bing.com"
+# 排名(Tranco, 2026-11 实测): adobe 59 / mozilla 92 / nginx 104 / samsung 122 /
+#   apache 140 / oracle 217 / ibm 282 / hp 285 / debian 325 / nvidia 352 / dell 361 /
+#   intel 453 / mysql 539 / python 742 / tesla 1105 / amd 1114 / postgresql 1161 /
+#   kernel 1272
+REALITY_DESTS="www.samsung.com www.nvidia.com www.amd.com www.ibm.com www.tesla.com www.adobe.com www.oracle.com www.dell.com www.hp.com www.intel.com www.mozilla.org www.python.org www.kernel.org www.debian.org www.apache.org www.nginx.com www.postgresql.org www.mysql.com"
 
 # 每个伪装目标站"是什么"。为什么要这东西: SNI 是必须一字不差抄进客户端的一行,
 # 而池子里有一半是 www.kernel.org / www.debian.org / www.nginx.com 这种普通用户
@@ -1728,7 +1740,6 @@ dest_note(){
     www.nginx.com)         echo "Nginx 官网" ;;
     www.postgresql.org)    echo "PostgreSQL 官网" ;;
     www.mysql.com)         echo "MySQL 官网" ;;
-    www.bing.com)          echo "微软 Bing 搜索引擎(只到 TLS1.2, 排在备选档)" ;;
     *) return 1 ;;
   esac
 }
@@ -5943,8 +5954,8 @@ cmd_dest(){
         fi
       done
       hr
-      echo -e "${D}共 ${n} 个, 全部实测: 不套 Cloudflare / 国内可直连 / 全球流量排名"
-      echo -e "2100 名以内; 除标注了备选档的, 均为 TLS 1.3 + ALPN h2。"
+      echo -e "${D}共 ${n} 个, 全部实测: TLS 1.3 + ALPN h2 / 不套 Cloudflare / 国内"
+      echo -e "可直连 / 全球流量排名 2100 名以内。"
       echo -e "安装时随机挑一个, 也可以自己指定(换站会重签证书并重写订阅):${N}"
       echo "  REALITY_DEST=www.oracle.com bash /root/setup-proxy.sh install"
       echo
