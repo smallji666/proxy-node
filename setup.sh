@@ -3500,6 +3500,11 @@ if on reality && [ $(( n % 6 )) -eq 0 ]; then
       "realitySettings": { "serverName": "${DEST}", "fingerprint": "${REALITY_FP:-chrome}",
         "publicKey": "${PUB:-}", "shortId": "${SID:-}", "spiderX": "/" } } } ] }
 JSON
+    # 上一轮探针若被 systemd 超时杀掉, 临时 xray 会残留并一直占着 10896 ——
+    # 本轮的端口等待会立刻通过(连到的是那个残留进程), 而下面 kill "$hp" 只杀
+    # 新起的那个, 残留的永远留着。按配置路径精确清一次: 只匹配本探针自己的
+    # /run/_hc.json, 不会碰到正式服务(/etc/xray/config.json)。
+    pkill -f '^/usr/local/bin/xray -c /run/_hc.json' >/dev/null 2>&1 || true
     /usr/local/bin/xray -c /run/_hc.json >/dev/null 2>&1 &
     hp=$!
     # 等临时 xray 把 SOCKS 端口监听上。固定 sleep 3 在慢机器上不够, 而端口还没

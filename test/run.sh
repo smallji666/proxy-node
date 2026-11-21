@@ -84,6 +84,11 @@ yesno "healthcheck 校验 REALITY_FP 防JSON注入" "$(has "$CODE" 'REALITY_FP=c
 # 探测用的临时 xray 还没监听就去 curl, 拿到的是 000, 连吃两次就判"隧道连续不可用"
 # 并重启一次用户的连接 —— 探测手段自己没准备好, 却去重启被探测的服务。
 yesno "healthcheck 等临时 xray 端口就绪" "$(has "$CODE" '/dev/tcp/127.0.0.1/10896')"
+# 探针进程必须在起新的之前先清残留。上一轮被 systemd 超时杀掉时临时 xray 会一直
+# 占着 10896: 本轮的端口等待立刻通过(连到残留进程), kill 只杀新起的那个, 残留的
+# 永远留着。清理要按探针自己的配置路径匹配, 不能宽到碰正式服务。
+yesno "healthcheck 起探针前清理残留进程" \
+  "$(has "$CODE" "pkill -f '^/usr/local/bin/xray -c /run/_hc.json'")"
 # cmd_name 改备注时 token 可能重生成, save_state 必须在 gen_sub_files 之后并重启订阅。
 yesno "cmd_name 改备注后 save_state 在 gen_sub_files 之后" "$(awk '
   /^cmd_name\(\)/ { in_fn=1 }
