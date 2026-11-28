@@ -1,0 +1,234 @@
+# proxy-node cn-direct
+# 国内直连域名清单(远程更新源)。proxy rule update 会把它拉到
+# /etc/proxy-node/remote-direct.txt, 与脚本内置清单合并去重后渲染进三端订阅
+# (Shadowrocket / Clash / sing-box)。改完这份文件, 用户执行 proxy rule update
+# 即可生效, 不用重装。
+#
+# 收录标准: 只收 100% 确定境内、且 DNS 解析落在中国大陆的服务。
+# 绝不收境外域名 —— 一个境外域名进这份名单, 它的 DNS 就会走国内明文,
+# 属地检测立刻看到中国运营商, 比多漏几个国内站严重得多。
+# 一行一个域名, # 开头是注释。单段后缀 cn 由脚本内置(这里不写, 格式校验不收单段)。
+
+# 电商购物
+taobao.com
+tmall.com
+jd.com
+jd.hk
+pinduoduo.com
+yangkeduo.com
+douyin.com
+kuaishou.com
+xiaohongshu.com
+meituan.com
+dianping.com
+ele.me
+suning.com
+vip.com
+dewu.com
+smzdm.com
+mogujie.com
+
+# 门户资讯
+baidu.com
+sina.com.cn
+sohu.com
+163.com
+netease.com
+qq.com
+ifeng.com
+toutiao.com
+people.com.cn
+xinhuanet.com
+cctv.com
+chinadaily.com.cn
+thepaper.cn
+ithome.com
+qdaily.com
+sspai.com
+zaker.com
+
+# 社区内容
+zhihu.com
+weibo.com
+bilibili.com
+douban.com
+hupu.com
+jianshu.com
+lofter.com
+qidian.com
+
+# 视频音乐
+iqiyi.com
+youku.com
+mgtv.com
+ixigua.com
+ximalaya.com
+kugou.com
+kuwo.cn
+qiyi.com
+douyu.com
+huya.com
+maoyan.com
+
+# 搜索工具
+sogou.com
+so.com
+qihoo.com
+youdao.com
+alidns.com
+dns.pub
+doh.pub
+
+# 支付金融
+alipay.com
+tenpay.com
+unionpay.com
+95516.com
+icbc.com.cn
+abchina.com
+boc.cn
+ccb.com
+bankcomm.com
+cmbchina.com
+spdb.com.cn
+citicbank.com
+cebbank.com
+cmbc.com.cn
+hxb.com.cn
+cib.com.cn
+psbc.com
+pingan.com
+chinalife.com.cn
+cpic.com.cn
+eastmoney.com
+dfcfw.com
+cailianpress.com
+tianyancha.com
+
+# 出行旅游
+ctrip.com
+qunar.com
+fliggy.com
+ly.com
+tuniu.com
+mafengwo.cn
+amap.com
+gaode.com
+xiaojukeji.com
+
+# 生活服务
+58.com
+ganji.com
+lianjia.com
+ke.com
+anjuke.com
+fang.com
+
+# 招聘求职
+zhaopin.com
+51job.com
+lagou.com
+bosszhipin.com
+
+# 汽车
+autohome.com.cn
+bitauto.com
+dongchedi.com
+
+# 科技企业
+dingtalk.com
+aliyun.com
+qcloud.com
+huaweicloud.com
+tencent.com
+huawei.com
+vmall.com
+mi.com
+xiaomi.com
+oppo.com
+honor.com
+meizu.com
+dji.com
+iflytek.com
+kingsoft.com
+wps.cn
+meitu.com
+servicewechat.com
+snwx.com
+aaplimg.com
+hicloud.com
+# 品牌关键词(cainiao/haier/lenovo)的主域名。mihomo 的 nameserver-policy
+# 不支持关键词子串, 这些域名必须进后缀清单才能让 Clash 的 DNS 与路由一致。
+# vipshop 关键词的主域名是 vip.com, 已在上面电商段, 不重复。
+cainiao.com
+haier.com
+lenovo.com
+
+# 邮箱运营商
+126.com
+yeah.net
+139.com
+189.cn
+10086.cn
+chinaunicom.com.cn
+
+# 物流快递
+sf-express.com
+yto.net.cn
+sto.cn
+yundaex.com
+zto.com
+ems.com.cn
+
+# 游戏
+mihoyo.com
+
+# 教育医疗
+xueersi.com
+zuoyebang.com
+yuanfudao.com
+dxy.cn
+haodf.com
+
+# 静态资源 / CDN
+# 国内站点的主域名和它的图片/JS/CSS 常常不同域(淘宝页面 taobao.com, 图片在
+# alicdn.com)。本配置的 GEOIP,CN 带 no-resolve, 域名请求只认白名单 —— 主域名进了
+# 名单、资源域名没进, 结果就是"页面能开, 图片一直转圈", 而且这些请求全走代理。
+# 只收确定的境内 CDN, 不认识的不加(加错一个境外域名 = 它的 DNS 走国内明文)。
+alicdn.com
+aliyuncs.com
+bdstatic.com
+bstatic.com
+bdatu.com
+yunjiasu-cdn.net
+gtimg.com
+qpic.cn
+qcloudimg.com
+myqcloud.com
+tencent-cloud.net
+hdslb.com
+bilivideo.com
+acgvideo.com
+biliapi.net
+zhimg.com
+xhscdn.com
+sinaimg.cn
+360buyimg.com
+pstatp.com
+snssdk.com
+byteimg.com
+douyinpic.com
+gifshow.com
+qhimg.com
+qhres.com
+mi-img.com
+meituan.net
+dxycdn.com
+ykimg.com
+cmbimg.com
+cctvpic.com
+126.net
+127.net
+163yun.com
+wangsu.com
+chinanetcenter.com

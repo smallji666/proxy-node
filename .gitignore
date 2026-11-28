@@ -1,0 +1,27 @@
+# 本地与编辑器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 绝对不要提交任何节点信息 / 部署产物
+*.env
+state.env
+proxy-info.txt
+*.pem
+*.key
+*config.json
+*config.yaml
+
+# 部署产物与本地诊断输出(含真实凭据, 绝不进公开仓库)
+*.tar.gz
+proxy-backup-*
+users.txt
+proxy-diag-*.txt
+sub.env
+# reset / restore 的状态快照与服务配置快照、自更新 / 内核升级的回滚副本
+*.before-reset*
+*.before-restore*
+*.prev
+# 本地开发用的外层镜像由 test/run.sh 负责逐字节比对, 不单独忽略
